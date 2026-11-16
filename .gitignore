@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.tr/
+*_TR/
+*_TR (*/
+TR 실험/
+*.hwp
+*.hwpx
+*.hml
+AI용.md
+원본보기.pdf
+편집.json
