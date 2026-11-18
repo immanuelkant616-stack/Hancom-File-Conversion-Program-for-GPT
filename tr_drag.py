@@ -3,6 +3,7 @@
 import ctypes as ct
 from ctypes import wintypes as wt
 from pathlib import Path
+from queue import Empty, SimpleQueue
 from uuid import UUID
 
 
@@ -29,6 +30,7 @@ _DROPEFFECT_MOVE = 2
 _GA_ROOT = 2
 _ALL_DROP_FILES = 0xFFFFFFFF
 _GMEM_MOVEABLE = 2
+_DROP_POLL_MS = 35
 
 
 class _GUID(ct.Structure):
@@ -60,6 +62,17 @@ class _STGMEDIUM(ct.Structure):
 
 class _POINTL(ct.Structure):
     _fields_ = (("x", wt.LONG), ("y", wt.LONG))
+
+
+# Windows passes an eight-byte aggregate the same way as an integer on
+# its 64-bit calling convention. Keep the native structure on 32-bit.
+_POINTL_ARGUMENT = ct.c_uint64 if ct.sizeof(_PVOID) == 8 else _POINTL
+
+
+def _point_coordinates(point):
+    if isinstance(point, int):
+        return wt.LONG(point & 0xFFFFFFFF).value, wt.LONG(point >> 32).value
+    return point.x, point.y
 
 
 def _api(library, name, returns, *arguments):
@@ -134,6 +147,8 @@ def _dropped_files(data_object):
 class _ComCallbacks:
     """Keep the native vtable and Python callbacks alive together."""
 
+    _live = {}
+
     def __init__(self, iid, methods):
         self._iid = bytes(iid)
         self._refs = 1
@@ -150,6 +165,7 @@ class _ComCallbacks:
         )
         self._object = ct.pointer(self._vtable)
         self.pointer = ct.cast(ct.pointer(self._object), _PVOID)
+        self._live[self.pointer.value] = self
 
     def _query_interface(self, this, iid, out):
         if not out:
@@ -169,6 +185,18 @@ class _ComCallbacks:
         self._refs -= 1
         return self._refs
 
+    def close(self):
+        self._release(self.pointer.value)
+        self.collect_released()
+
+    @classmethod
+    def collect_released(cls):
+        # Defer collection until back in Python code outside the released
+        # COM callback, since its native trampoline is still returning.
+        for address, callback in tuple(cls._live.items()):
+            if callback._refs == 0:
+                del cls._live[address]
+
 
 _outgoing_drag = False
 
@@ -177,7 +205,8 @@ class DropReceiver:
     """Listen for physical files dropped on a Tk top-level window.
 
     callback receives (tuple[Path, ...], x_screen, y_screen) on the Tk thread.
-    accepts is an optional screen-coordinate filter for valid drop areas.
+    accepts is an optional screen-coordinate filter run on the Tk thread
+    when delivering a queued drop. Set enabled=False to deny native drops.
     """
 
     def __init__(self, root, callback, accepts=None):
@@ -186,47 +215,52 @@ class DropReceiver:
         self._accepts = accepts
         self._can_read = False
         self._closed = False
+        self.enabled = True
+        self._pending = SimpleQueue()
+        self._timer = None
         root.update_idletasks()
         hwnd = root.winfo_id()
         self._hwnd = _get_ancestor(hwnd, _GA_ROOT) or hwnd
         effect = ct.POINTER(wt.DWORD)
         self._native = _ComCallbacks(_IID_DROP_TARGET, (
-            (_HRESULT, (_PVOID, wt.DWORD, _POINTL, effect), self._enter),
-            (_HRESULT, (wt.DWORD, _POINTL, effect), self._over),
+            (_HRESULT, (_PVOID, wt.DWORD, _POINTL_ARGUMENT, effect), self._enter),
+            (_HRESULT, (wt.DWORD, _POINTL_ARGUMENT, effect), self._over),
             (_HRESULT, (), self._leave),
-            (_HRESULT, (_PVOID, wt.DWORD, _POINTL, effect), self._drop),
+            (_HRESULT, (_PVOID, wt.DWORD, _POINTL_ARGUMENT, effect), self._drop),
         ))
-        _check(_ole_initialize(None), "Windows 파일 끌어놓기를 초기화할 수 없습니다")
         try:
-            _check(_register_drop(self._hwnd, self._native.pointer),
-                   "Windows 파일 끌어놓기를 등록할 수 없습니다")
+            _check(_ole_initialize(None), "Windows 파일 끌어놓기를 초기화할 수 없습니다")
+            try:
+                _check(_register_drop(self._hwnd, self._native.pointer),
+                       "Windows 파일 끌어놓기를 등록할 수 없습니다")
+            except BaseException:
+                _ole_uninitialize()
+                raise
         except BaseException:
-            _ole_uninitialize()
+            self._native.close()
             raise
-        root.bind("<Destroy>", self._destroy, add="+")
+        try:
+            root.bind("<Destroy>", self._destroy, add="+")
+            self._timer = root.after(_DROP_POLL_MS, self._dispatch)
+        except BaseException:
+            self.close()
+            raise
 
-    def _effect(self, point, offered):
-        if self._closed or _outgoing_drag or not self._can_read or not offered & _DROPEFFECT_COPY:
+    def _effect(self, offered):
+        if self._closed or not self.enabled or _outgoing_drag or not self._can_read:
             return _DROPEFFECT_NONE
-        if self._accepts is not None and not self._accepts(point.x, point.y):
-            return _DROPEFFECT_NONE
-        return _DROPEFFECT_COPY
+        return offered & _DROPEFFECT_COPY
 
     def _enter(self, _, data_object, keys, point, effect):
         self._can_read = False
         try:
             self._can_read = not _outgoing_drag and _has_files(data_object)
         except Exception as error:
-            self._root.report_callback_exception(type(error), error, error.__traceback__)
+            self._pending.put(error)
         return self._over(None, keys, point, effect)
 
-    def _over(self, _, _keys, point, effect):
-        offered = effect[0]
-        effect[0] = _DROPEFFECT_NONE
-        try:
-            effect[0] = self._effect(point, offered)
-        except Exception as error:
-            self._root.report_callback_exception(type(error), error, error.__traceback__)
+    def _over(self, _, _keys, _point, effect):
+        effect[0] = self._effect(effect[0])
         return _S_OK
 
     def _leave(self, _):
@@ -237,21 +271,37 @@ class DropReceiver:
         offered = effect[0]
         effect[0] = _DROPEFFECT_NONE
         try:
-            if self._effect(point, offered):
+            if self._effect(offered):
                 paths = _dropped_files(data_object)
                 if paths:
-                    # Let the OLE drop return before starting Tk work.
-                    self._root.after_idle(self._deliver, paths, point.x, point.y)
+                    # OLE may call us during Tcl's Windows message dispatch.
+                    # Even scheduling after_idle here would reenter Tcl.
+                    self._pending.put((paths, *_point_coordinates(point)))
                     effect[0] = _DROPEFFECT_COPY
         except Exception as error:
-            self._root.report_callback_exception(type(error), error, error.__traceback__)
+            self._pending.put(error)
         finally:
             self._can_read = False
         return _S_OK
 
-    def _deliver(self, paths, x, y):
-        if not self._closed:
-            self._callback(paths, x, y)
+    def _dispatch(self):
+        self._timer = None
+        _ComCallbacks.collect_released()
+        try:
+            while not self._closed:
+                try:
+                    item = self._pending.get_nowait()
+                except Empty:
+                    break
+                if isinstance(item, Exception):
+                    self._root.report_callback_exception(type(item), item, item.__traceback__)
+                    continue
+                paths, x, y = item
+                if self.enabled and (self._accepts is None or self._accepts(x, y)):
+                    self._callback(paths, x, y)
+        finally:
+            if not self._closed:
+                self._timer = self._root.after(_DROP_POLL_MS, self._dispatch)
 
     def _destroy(self, event):
         if event.widget is self._root:
@@ -260,8 +310,14 @@ class DropReceiver:
     def close(self):
         if not self._closed:
             self._closed = True
-            _revoke_drop(self._hwnd)
-            _ole_uninitialize()
+            try:
+                if self._timer is not None:
+                    self._root.after_cancel(self._timer)
+                    self._timer = None
+            finally:
+                _revoke_drop(self._hwnd)
+                _ole_uninitialize()
+                self._native.close()
 
 
 def _file_object(path):
@@ -330,6 +386,7 @@ def drag_file(path, *, allow_move=False):
     _check(_ole_initialize(None), "Windows 파일 끌기를 초기화할 수 없습니다")
     _outgoing_drag = True
     data_object = None
+    source = None
     try:
         data_object = _file_object(path)
         source = _ComCallbacks(_IID_DROP_SOURCE, (
@@ -352,5 +409,7 @@ def drag_file(path, *, allow_move=False):
     finally:
         if data_object:
             _method(data_object, 2, wt.ULONG)(data_object)
+        if source is not None:
+            source.close()
         _outgoing_drag = False
         _ole_uninitialize()

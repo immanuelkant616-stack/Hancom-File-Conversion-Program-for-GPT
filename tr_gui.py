@@ -4,6 +4,7 @@ import os
 import queue
 import threading
 import tkinter as tk
+import traceback
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, font, ttk
@@ -209,11 +210,12 @@ class ConverterWindow:
         self.result_card.configure(width=455)
         self.result_card.grid(row=2, column=0, pady=(0, 18))
         self.build_activity()
+        root.report_callback_exception = self.callback_error
         self.refresh()
         self.set_status("원본 한글 파일을 놓아 시작하세요.")
         root.update_idletasks()
         try:
-            self.receiver = DropReceiver(root, self.on_drop, accepts=lambda _x, _y: self.job is None)
+            self.receiver = DropReceiver(root, self.on_drop)
         except (OSError, RuntimeError) as error:
             self.set_status("끌어놓기를 시작할 수 없습니다. 카드를 클릭해 파일을 선택하세요.", "error")
             self.add_log(str(error), "error")
@@ -328,11 +330,13 @@ class ConverterWindow:
         self.progress.configure(mode="indeterminate")
         self.progress.start(14)
 
+        results = self.results
+
         def work():
             try:
-                self.results.put((action(*args), None))
+                results.put((action(*args), None))
             except Exception as error:
-                self.results.put((None, error))
+                results.put((None, str(error) or type(error).__name__))
 
         threading.Thread(target=work, name="tr-converter").start()
         self.root.after(60, self.check_result)
@@ -348,7 +352,7 @@ class ConverterWindow:
         self.progress.configure(mode="determinate", value=0)
         if error is not None:
             self.refresh()
-            self.report_error(str(error) or type(error).__name__)
+            self.report_error(error)
             return
         if kind == "export":
             project, detail = result
@@ -386,6 +390,10 @@ class ConverterWindow:
     def report_error(self, message):
         self.set_status("작업을 완료하지 못했습니다. 아래 기록을 확인하세요.", "error")
         self.add_log(message, "error")
+
+    def callback_error(self, error_type, error, stack):
+        traceback.print_exception(error_type, error, stack)
+        self.report_error(str(error) or error_type.__name__)
 
     def open_file(self, path):
         if path is None:
