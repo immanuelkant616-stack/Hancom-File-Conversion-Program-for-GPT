@@ -1,16 +1,22 @@
 """Native table and picture edits in Hancom HWPML 2.x."""
 
 import base64
+import re
 import zlib
+from copy import deepcopy
 from xml.etree import ElementTree as ET
+
+import tr_layout
 
 
 OBJECT_FIELDS = {
     "set_table_cell": ({"target", "row", "col", "text"}, set()),
-    "insert_table": ({"target", "cells"}, {"width_mm"}),
+    "format_table_cell": ({"target", "row", "col"}, {"background", "align", "vertical_align"}),
+    "insert_table": ({"target", "cells"}, {"width_mm", "col_widths", "header_row", "header_background",
+                                           "position", "id"}),
     "delete_object": ({"target"}, set()),
     "replace_image": ({"target", "asset"}, set()),
-    "insert_image": ({"target", "asset"}, {"width_mm", "height_mm"}),
+    "insert_image": ({"target", "asset"}, {"width_mm", "height_mm", "position", "id"}),
 }
 
 _REMOVABLE_OBJECTS = {
@@ -20,6 +26,7 @@ _REMOVABLE_OBJECTS = {
 _JPEG_FRAME_MARKERS = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
                        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 _ZERO_MARGIN = dict(Left="0", Right="0", Top="0", Bottom="0")
+_VERTICAL_ALIGNMENTS = {"top": "Top", "center": "Center", "bottom": "Bottom"}
 
 
 def apply_object(doc, operation):
@@ -27,7 +34,7 @@ def apply_object(doc, operation):
     _HANDLERS[operation["op"]](doc, operation)
 
 
-def _edit_cell(doc, operation):
+def _find_cell(doc, operation):
     table = doc.get(operation["target"], "table")
     row, col = operation["row"], operation["col"]
     if type(row) is not int or type(col) is not int or row < 1 or col < 1:
@@ -39,6 +46,11 @@ def _edit_cell(doc, operation):
         raise ValueError(f"{row}행 {col}열에 독립된 셀이 없습니다. 병합 셀은 시작 주소를 쓰세요.")
     if cell.get("Protect", "false").lower() == "true":
         raise ValueError("보호된 표 셀은 수정할 수 없습니다.")
+    return cell
+
+
+def _edit_cell(doc, operation):
+    cell = _find_cell(doc, operation)
     paragraphs = cell.findall("./PARALIST/P")
     if len(paragraphs) != 1:
         raise ValueError("이 명령은 문단이 한 개인 셀에 적용할 수 있습니다. 문단 ID를 사용하세요.")
@@ -53,6 +65,28 @@ def _edit_cell(doc, operation):
     doc.replace_paragraph_text(paragraph, value)
 
 
+def _format_cell(doc, operation):
+    if not OBJECT_FIELDS["format_table_cell"][1].intersection(operation):
+        raise ValueError("바꿀 셀 서식을 하나 이상 지정하세요.")
+    cell = _find_cell(doc, operation)
+    contents = cell.find("PARALIST")
+    if contents is None:
+        raise ValueError("셀의 문단 목록을 찾을 수 없습니다.")
+
+    vertical = None
+    if "vertical_align" in operation:
+        vertical = tr_layout.choice(operation["vertical_align"], "vertical_align", _VERTICAL_ALIGNMENTS)
+    background = _color_ref(operation["background"], "background") if "background" in operation else None
+    if "align" in operation:
+        alignment = {"align": operation["align"]}
+        for paragraph in contents.findall("P"):
+            tr_layout.set_paragraph_format(doc, paragraph, alignment)
+    if vertical is not None:
+        contents.set("VertAlign", vertical)
+    if background is not None:
+        cell.set("BorderFill", _filled_border(doc.root, cell.get("BorderFill"), background))
+
+
 def _cell_text(value):
     if not isinstance(value, str):
         raise ValueError("셀 내용은 문자열이어야 합니다.")
@@ -60,6 +94,86 @@ def _cell_text(value):
            for char in value):
         raise ValueError("셀 내용은 줄바꿈과 제어 문자가 없는 한 줄이어야 합니다.")
     return value
+
+
+def _cell_lines(value):
+    """New table cells may hold several paragraphs separated by newlines."""
+    if not isinstance(value, str):
+        raise ValueError("셀 내용은 문자열이어야 합니다.")
+    return [_cell_text(line) for line in value.replace("\r\n", "\n").split("\n")]
+
+
+def _paragraph_margins(doc, paragraph):
+    shapes = doc.root.find("HEAD/MAPPINGTABLE/PARASHAPELIST")
+    shape = None if shapes is None else next(
+        (item for item in shapes.findall("PARASHAPE") if item.get("Id") == paragraph.get("ParaShape", "0")), None)
+    margin = None if shape is None else shape.find("PARAMARGIN")
+    if margin is None:
+        return 0
+    return max(int(margin.get("Left", "0")), 0) + max(int(margin.get("Right", "0")), 0)
+
+
+def _available_width(doc, anchor):
+    """Width a new inline object can use at the anchor paragraph, in HWP units."""
+    area = _area_width(doc, anchor)
+    if area is None:
+        return None
+    return max(area - _paragraph_margins(doc, anchor), 0) or None
+
+
+def _area_width(doc, anchor):
+    node = anchor
+    while True:
+        parent = doc.parent(node)
+        if parent is None:
+            return None
+        if parent.tag == "CELL":
+            margins = parent.find("CELLMARGIN")
+            inset = 0
+            if margins is not None and parent.get("HasMargin", "false").lower() == "true":
+                inset = int(margins.get("Left", "0")) + int(margins.get("Right", "0"))
+            else:
+                table = doc.parent(doc.parent(parent))
+                inner = table.find("INSIDEMARGIN") if table is not None else None
+                inset = 0 if inner is None else int(inner.get("Left", "0")) + int(inner.get("Right", "0"))
+            return max(int(parent.get("Width", "0")) - inset, 0) or None
+        if parent.tag == "SECTION":
+            page = tr_layout.section_page(parent)
+            body = tr_layout.dimensions(page, tr_layout.child_or_error(page, "PAGEMARGIN"))[0]
+            columns = None
+            for paragraph in parent.findall("P"):
+                for definition in paragraph.findall("TEXT/COLDEF"):
+                    columns = definition
+                if paragraph is node:
+                    break
+            if columns is None:
+                return body
+            count = max(int(columns.get("Count", "1")), 1)
+            gap = int(columns.get("SameGap", "0"))
+            widths = [int(item.get("Width", "0")) for item in columns.iter("COLUMN")]
+            if columns.get("SameSize", "true") != "true" and widths and min(widths) > 0:
+                return min(widths)
+            return max((body - gap * (count - 1)) // count, 0) or None
+        if parent.tag == "PARALIST":
+            owner = doc.parent(parent)
+            if owner is None or owner.tag != "CELL":
+                return None
+        node = parent
+
+
+def _column_widths(operation, cols, width):
+    if "col_widths" not in operation:
+        return [(index + 1) * width // cols - index * width // cols for index in range(cols)]
+    ratios = operation["col_widths"]
+    if (not isinstance(ratios, list) or len(ratios) != cols
+            or any(type(value) not in (int, float) or value <= 0 for value in ratios)):
+        raise ValueError("col_widths는 열 수와 같은 길이의 양수 배열이어야 합니다.")
+    total = sum(ratios)
+    edges = [round(width * sum(ratios[:index]) / total) for index in range(cols + 1)]
+    widths = [right - left for left, right in zip(edges, edges[1:])]
+    if min(widths) < 1:
+        raise ValueError("열 너비가 너무 좁습니다.")
+    return widths
 
 
 def _dimension_units(value, key):
@@ -96,19 +210,48 @@ def _new_shape(doc, owner, numbering, width, height):
     return instance
 
 
-def _table_border(root):
+def _border_list(root):
     borders = root.find("./HEAD/MAPPINGTABLE/BORDERFILLLIST")
     if borders is None:
         raise ValueError("문서의 테두리 서식 목록을 찾을 수 없습니다.")
-    existing = borders.findall("./BORDERFILL")
-    border_id = str(max((int(item.get("Id", "0")) for item in existing), default=0) + 1)
-    border = ET.SubElement(borders, "BORDERFILL", Id=border_id, BackSlash="0", Slash="0",
-                           Shadow="false", ThreeD="false")
+    return borders
+
+
+def _append_border(borders, border):
+    existing = borders.findall("BORDERFILL")
+    identifier = str(max((int(item.get("Id", "0")) for item in existing), default=0) + 1)
+    border.set("Id", identifier)
+    borders.append(border)
+    borders.set("Count", str(len(existing) + 1))
+    return identifier
+
+
+def _table_border(root):
+    border = ET.Element("BORDERFILL", BackSlash="0", Slash="0", Shadow="false", ThreeD="false")
     for kind in ("LEFTBORDER", "RIGHTBORDER", "TOPBORDER", "BOTTOMBORDER"):
         ET.SubElement(border, kind, Type="Solid", Width="0.12mm", Color="0")
     ET.SubElement(border, "DIAGONAL", Type="None", Width="0.12mm", Color="0")
-    borders.set("Count", str(len(existing) + 1))
-    return border_id
+    return _append_border(_border_list(root), border)
+
+
+def _color_ref(value, key):
+    if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        raise ValueError(f"{key}에 #RRGGBB 색상 값을 입력하세요.")
+    return str(int.from_bytes(bytes.fromhex(value[1:]), "little"))
+
+
+def _filled_border(root, identifier, color):
+    borders = _border_list(root)
+    base = next((item for item in borders.findall("BORDERFILL") if item.get("Id") == identifier), None)
+    if base is None:
+        raise ValueError("셀의 원래 테두리 서식을 찾을 수 없습니다.")
+    clone = deepcopy(base)
+    brush = clone.find("FILLBRUSH")
+    if brush is not None:
+        clone.remove(brush)
+    brush = ET.SubElement(clone, "FILLBRUSH")
+    ET.SubElement(brush, "WINDOWBRUSH", Alpha="0", FaceColor=color, HatchColor="0")
+    return _append_border(borders, clone)
 
 
 def _insert_table(doc, operation):
@@ -125,34 +268,58 @@ def _insert_table(doc, operation):
         if not isinstance(row, list) or len(row) != cols:
             raise ValueError("새 표의 모든 행은 열 수가 같아야 합니다.")
         for value in row:
-            _cell_text(value)
+            _cell_lines(value)
+    position = operation.get("position", "end")
 
-    width = _dimension_units(operation.get("width_mm", 55), "width_mm")
-    if width < cols:
+    header_row = operation.get("header_row", "header_background" in operation)
+    if type(header_row) is not bool:
+        raise ValueError("header_row에 true 또는 false를 입력하세요.")
+    header_color = None
+    if "header_background" in operation:
+        if not header_row:
+            raise ValueError("header_background를 지정하려면 첫 행을 제목 행으로 설정하세요.")
+        header_color = _color_ref(operation["header_background"], "header_background")
+    if "width_mm" in operation:
+        width = _dimension_units(operation["width_mm"], "width_mm")
+    else:
+        # Fill the column or cell the table lands in, like a table drawn in Hangul.
+        available = _available_width(doc, anchor)
+        width = available - 100 if available and available > 2000 else _dimension_units(55, "width_mm")
+    if width < cols * 300:
         raise ValueError("열당 폭이 너무 좁습니다. 열 수를 줄이거나 표 폭을 늘리세요.")
+    column_widths = _column_widths(operation, cols, width)
     row_height = 1800
     border = _table_border(doc.root)
+    header_border = border if header_color is None else _filled_border(doc.root, border, header_color)
     table = ET.Element("TABLE", BorderFill=border, CellSpacing="0", ColCount=str(cols),
-                       PageBreak="Cell", RepeatHeader="false", RowCount=str(rows))
+                       PageBreak="Cell", RepeatHeader=str(header_row).lower(), RowCount=str(rows))
     _new_shape(doc, table, "Table", width, rows * row_height)
-    ET.SubElement(table, "INSIDEMARGIN", _ZERO_MARGIN)
+    # Hangul's own default cell padding: 1.8mm left/right, 0.5mm top/bottom.
+    ET.SubElement(table, "INSIDEMARGIN", Left="510", Right="510", Top="141", Bottom="141")
     char_shape = doc.char_shape(anchor)
     for row_number, values in enumerate(cells):
+        header = header_row and row_number == 0
         row = ET.SubElement(table, "ROW")
         for col_number, value in enumerate(values):
-            cell_width = (col_number + 1) * width // cols - col_number * width // cols
-            cell = ET.SubElement(row, "CELL", BorderFill=border, ColAddr=str(col_number), ColSpan="1",
-                                 Dirty="false", Editable="false", HasMargin="false", Header="false",
+            cell_width = column_widths[col_number]
+            cell = ET.SubElement(row, "CELL", BorderFill=header_border if header else border,
+                                 ColAddr=str(col_number), ColSpan="1",
+                                 Dirty="false", Editable="false", HasMargin="false", Header=str(header).lower(),
                                  Height=str(row_height), Protect="false", RowAddr=str(row_number),
                                  RowSpan="1", Width=str(cell_width))
             ET.SubElement(cell, "CELLMARGIN", Left="141", Right="141", Top="141", Bottom="141")
             plist = ET.SubElement(cell, "PARALIST", LineWrap="Break", LinkListID="0", LinkListIDNext="0",
                                   TextDirection="0", VertAlign="Center")
-            paragraph = ET.SubElement(plist, "P", ParaShape="0", Style="0")
-            ET.SubElement(paragraph, "TEXT", CharShape=char_shape)
-            if value:
-                doc.replace_paragraph_text(paragraph, value)
-    doc.add_control(anchor, table)
+            for line in _cell_lines(value):
+                paragraph = ET.SubElement(plist, "P", ParaShape="0", Style="0")
+                ET.SubElement(paragraph, "TEXT", CharShape=char_shape)
+                if line:
+                    doc.replace_paragraph_text(paragraph, line)
+                if header:
+                    tr_layout.set_paragraph_format(doc, paragraph, {"align": "center"})
+                    doc.format_character_runs(paragraph, {"bold": True})
+    doc.register(operation.get("id"), table, "table")
+    doc.add_control(anchor, table, position)
 
 
 def _delete_object(doc, operation):
@@ -290,6 +457,9 @@ def _insert_image(doc, operation):
     aspect = pixels_wide / pixels_high
     if width_mm is None and height_mm is None:
         width_mm = min(45, 45 * aspect)
+        available = _available_width(doc, anchor)
+        if available:
+            width_mm = min(width_mm, available * 25.4 / 7200)
     if width_mm is None:
         width_mm = height_mm * aspect
     if height_mm is None:
@@ -315,11 +485,13 @@ def _insert_image(doc, operation):
     ET.SubElement(picture, "IMAGE", Alpha="0", BinItem=_embed_image(doc.root, data, image_format),
                   Bright="0", Contrast="0", Effect="RealPic")
     ET.SubElement(picture, "EFFECTS")
-    doc.add_control(anchor, picture)
+    doc.register(operation.get("id"), picture, "picture")
+    doc.add_control(anchor, picture, operation.get("position", "end"))
 
 
 _HANDLERS = {
     "set_table_cell": _edit_cell,
+    "format_table_cell": _format_cell,
     "insert_table": _insert_table,
     "delete_object": _delete_object,
     "replace_image": _replace_image,

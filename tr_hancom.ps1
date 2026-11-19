@@ -12,6 +12,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $utf8 = [Text.UTF8Encoding]::new($false, $true)
+[Console]::OutputEncoding = $utf8
 
 function Get-NewPath([string]$Path) {
     $fullPath = [IO.Path]::GetFullPath($Path)

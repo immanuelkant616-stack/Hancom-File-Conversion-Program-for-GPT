@@ -11,21 +11,49 @@ from tkinter import filedialog, font, ttk
 
 from tr_core import AI_DOCUMENT, FORMATS
 from tr_drag import DropReceiver, drag_file
-from tr_workflow import apply_dropped, export_dropped, project_metadata
+from tr_history import show_project_history
+from tr_surface import clay_photo
+from tr_workflow import (EDIT_TYPES, IMAGE_TYPES, add_images, export_dropped, finish_edit, prepare_edit,
+                         project_metadata, project_outputs, projects_folder)
 
 
-BACKGROUND = "#F3EFFB"
-PAPER = "#FBF9FF"
-WHITE = "#FFFFFF"
-TEXT = "#251D3A"
-MUTED = "#5E5473"
-LAVENDER = "#EDE5FC"
-BORDER = "#D9CDEB"
-ACCENT = "#6844AF"
-ACCENT_DARK = "#543390"
-HOVER = "#F7F1FF"
-ERROR = "#982854"
-SUCCESS = "#326346"
+BACKGROUND = "#ECE4F0"
+PAPER = "#F8F0FA"
+WHITE = "#FFFAFE"
+TEXT = "#34263F"
+MUTED = "#64516E"
+LAVENDER = "#EBDCF4"
+BORDER = "#D3C0DC"
+CARD_OUTLINE = "#8D71A6"
+ACCENT = "#7753A9"
+ACCENT_DARK = "#543480"
+ERROR = "#9B3353"
+SUCCESS = "#2B6A54"
+
+GOLDEN_RATIO = 1.61803398875
+DEFAULT_WIDTH = 848
+DEFAULT_HEIGHT = round(DEFAULT_WIDTH / GOLDEN_RATIO)
+MIN_WIDTH = 735
+CARD_COLORS = {
+    "source": "#F4E4F0",
+    "markdown": "#EEE1F7",
+    "json": "#E9E5F8",
+    "result": "#F2E6F6",
+}
+
+
+def screen_fonts(root):
+    families = set(font.families(root))
+    family = next((name for name in ("Pretendard", "Noto Sans KR", "나눔고딕", "맑은 고딕")
+                   if name in families), font.nametofont("TkDefaultFont", root=root).actual("family"))
+    semibold = "Pretendard SemiBold" if family == "Pretendard" and "Pretendard SemiBold" in families else None
+    roles = {
+        "heading": (22, True), "card": (11, True), "label": (10, True),
+        "body": (10, False), "hint": (9, False), "mark": (14, True),
+    }
+    return {role: font.Font(root, family=semibold if strong and semibold else family, size=size,
+                            weight="bold" if strong and not semibold else "normal")
+            for role, (size, strong) in roles.items()}
 
 
 def rounded(canvas, x0, y0, x1, y1, radius, **options):
@@ -36,8 +64,10 @@ def rounded(canvas, x0, y0, x1, y1, radius, **options):
 
 
 class FileCard(tk.Canvas):
-    def __init__(self, parent, title, kind, click, get_path, drag, *, wide=False):
-        super().__init__(parent, background=BACKGROUND, height=116 if wide else 177,
+    def __init__(self, parent, title, kind, click, get_path, drag, *, fonts, wide=False):
+        title_line = fonts["card"].metrics("linespace")
+        height = max(84, 3 * title_line + 21) if wide else max(153, 101 + 4 * title_line)
+        super().__init__(parent, background=BACKGROUND, height=height,
                          highlightthickness=0, borderwidth=0, takefocus=True)
         self.title = title
         self.kind = kind
@@ -50,8 +80,13 @@ class FileCard(tk.Canvas):
         self.enabled = False
         self.hover = False
         self.press = None
-        self.detail_font = font.Font(self, family="Malgun Gothic", size=10)
-        self.bind("<Configure>", self.draw)
+        self.fonts = fonts
+        self.detail_font = fonts["body"]
+        self.surface = None
+        self.surface_key = None
+        self.resize_timer = None
+        self.bind("<Configure>", self.schedule_draw)
+        self.bind("<Destroy>", self.cancel_draw)
         self.bind("<Enter>", lambda event: self.set_hover(True))
         self.bind("<Leave>", lambda event: self.set_hover(False))
         self.bind("<FocusIn>", self.draw)
@@ -61,6 +96,19 @@ class FileCard(tk.Canvas):
         self.bind("<ButtonRelease-1>", self.mouse_up)
         self.bind("<Return>", self.activate)
         self.bind("<space>", self.activate)
+
+    def schedule_draw(self, _event):
+        if self.resize_timer is None:
+            self.resize_timer = self.after_idle(self.draw_after_resize)
+
+    def draw_after_resize(self):
+        self.resize_timer = None
+        self.draw()
+
+    def cancel_draw(self, _event):
+        if self.resize_timer is not None:
+            self.after_cancel(self.resize_timer)
+            self.resize_timer = None
 
     def update_card(self, detail, hint, enabled):
         self.detail, self.hint, self.enabled = detail, hint, enabled
@@ -118,33 +166,64 @@ class FileCard(tk.Canvas):
         focused = self.focus_get() == self
         ready = self.get_path() is not None
         active = self.hover and self.enabled
-        fill = HOVER if active else WHITE if ready else PAPER
-        outline = ACCENT if (active or focused) and self.enabled else BORDER
-        rounded(self, 3, 4, width - 2, height - 1, 16, fill="#E7DFF3", outline="")
-        rounded(self, 2, 2, width - 3, height - 4, 16, fill=fill, outline=outline,
-                width=2 if focused and self.enabled else 1)
+        color = "#EBD9F5" if self.wide and ready else CARD_COLORS[self.kind]
+        outline = CARD_OUTLINE
+        if self.enabled:
+            outline = ACCENT_DARK if focused else ACCENT if active else CARD_OUTLINE
+        surface_key = (width, height, color, outline)
+        if self.surface_key != surface_key:
+            self.surface = clay_photo(self, width, height, color, outline=outline, radius=20)
+            self.surface_key = surface_key
+        self.create_image(0, 0, anchor="nw", image=self.surface)
         if self.wide:
-            x = 63
-            y = height // 2
-            self.draw_icon(x, y, ready)
-            self.create_text(105, y - 24, text=self.title, font=("Malgun Gothic", 12, "bold"),
-                             fill=TEXT, anchor="w")
-            self.create_text(105, y, text=self.fit_detail(width - 135), font=self.detail_font,
-                             fill=TEXT if ready else MUTED, anchor="w")
-            self.create_text(105, y + 26, text=self.hint, font=("Malgun Gothic", 9),
-                             fill=ACCENT_DARK if ready else MUTED, anchor="w")
+            self.draw_result(width, height, ready)
             return
-        x = width // 2
-        self.draw_icon(x, 42, ready)
-        self.create_text(x, 81, text=self.title, font=("Malgun Gothic", 12, "bold"), fill=TEXT)
-        self.create_text(x, 113, text=self.fit_detail(width - 34), font=self.detail_font,
-                         fill=TEXT if ready else MUTED)
-        self.create_text(x, 144, text=self.hint, font=("Malgun Gothic", 9), fill=ACCENT_DARK)
+        left = 21
+        self.draw_icon(left + 15, 28, ready)
+        title = self.create_text(left, 49, anchor="nw", text=self.title, font=self.fonts["card"],
+                                 fill=TEXT, width=width - 2 * left, tags=("title",))
+        title_bottom = self.bbox(title)[3]
+        detail_line = self.detail_font.metrics("linespace")
+        detail_y = max(108, title_bottom + detail_line // 2 + 8)
+        detail = self.fit_detail(width - 2 * left - (16 if ready else 0))
+        if ready:
+            chip_width = self.detail_font.measure(detail) + 16
+            half_height = (detail_line + 9) // 2
+            rounded(self, left, detail_y - half_height, left + chip_width, detail_y + half_height,
+                    8, fill="#F8EFFC", outline="#DFCAE9")
+        self.create_text(left + (8 if ready else 0), detail_y, anchor="w", text=detail,
+                         font=self.detail_font, fill=ACCENT_DARK if ready else MUTED, tags=("detail",))
+        hint_y = detail_y + (detail_line + self.fonts["hint"].metrics("linespace")) // 2 + 6
+        self.create_text(left, hint_y, anchor="w", text=self.hint, font=self.fonts["hint"],
+                         fill=MUTED, tags=("hint",))
+
+    def draw_result(self, width, height, ready):
+        y = height // 2
+        self.draw_icon(35, y, ready)
+        title_line = self.fonts["card"].metrics("linespace")
+        text_lines = self.detail_font.metrics("linespace") + self.fonts["hint"].metrics("linespace")
+        title_y = y - (title_line + text_lines + 7) // 2
+        self.create_text(62, title_y, text=self.title, font=self.fonts["card"],
+                         fill=TEXT, anchor="nw", tags=("title",))
+        detail_y = title_y + title_line + 4
+        button_text = "편집본 열기"
+        reserved = self.fonts["label"].measure(button_text) + 60 if ready else 24
+        self.create_text(62, detail_y, text=self.fit_detail(width - 62 - reserved),
+                         font=self.detail_font, fill=TEXT if ready else MUTED, anchor="nw", tags=("detail",))
+        if ready:
+            self.create_text(62, detail_y + self.detail_font.metrics("linespace") + 3,
+                             text=self.hint, font=self.fonts["hint"], fill=MUTED, anchor="nw", tags=("hint",))
+            button_left = width - reserved + 10
+            half_height = self.fonts["label"].metrics("linespace") // 2 + 7
+            rounded(self, button_left, y - half_height, width - 23, y + half_height,
+                    11, fill=WHITE, outline=CARD_OUTLINE)
+            self.create_text((button_left + width - 23) // 2, y, text=button_text,
+                             font=self.fonts["label"], fill=ACCENT_DARK)
 
     def draw_icon(self, x, y, ready):
-        ink = WHITE if ready else ACCENT
-        rounded(self, x - 21, y - 21, x + 21, y + 21, 11,
-                fill=ACCENT if ready else LAVENDER, outline="")
+        ink = ACCENT_DARK if ready else ACCENT
+        rounded(self, x - 15, y - 15, x + 15, y + 15, 10,
+                fill="#F4E7FC" if ready else "#F9EFFC", outline=BORDER)
         if self.kind == "source":
             self.create_line(x, y - 11, x, y + 4, fill=ink, width=2)
             self.create_line(x - 5, y, x, y + 5, x + 5, y, fill=ink, width=2)
@@ -175,45 +254,55 @@ class ConverterWindow:
         self.job = None
         self.results = queue.SimpleQueue()
         self.receiver = None
+        self.history_window = None
+        self.fonts = screen_fonts(root)
 
         root.title("TR · 한글 문서 편집")
         root.configure(background=BACKGROUND)
-        root.minsize(790, 576)
-        root.geometry("980x634")
+        root.minsize(MIN_WIDTH, 440)
+        root.geometry(f"{DEFAULT_WIDTH}x{DEFAULT_HEIGHT}")
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.rowconfigure(0, weight=1)
         root.columnconfigure(0, weight=1)
 
-        self.frame = tk.Frame(root, background=BACKGROUND, padx=28, pady=23)
+        self.frame = tk.Frame(root, background=BACKGROUND, padx=19, pady=15)
         self.frame.grid(sticky="nsew")
         self.frame.columnconfigure(0, weight=1)
         self.frame.rowconfigure(3, weight=1)
         self.build_header()
 
         cards = tk.Frame(self.frame, background=BACKGROUND)
-        cards.grid(row=1, column=0, sticky="ew", pady=(19, 17))
+        cards.grid(row=1, column=0, sticky="ew", pady=(10, 6))
         for index in range(3):
             cards.columnconfigure(index, weight=1, uniform="workflow")
-        self.source_card = FileCard(cards, "원본 한글", "source", self.choose_source, lambda: None, None)
-        self.md_card = FileCard(cards, "AI에 보낼 파일", "markdown",
+        self.source_card = FileCard(cards, "한컴 파일을 이곳에 첨부하세요", "source",
+                                   self.choose_source, lambda: None, None, fonts=self.fonts)
+        self.md_card = FileCard(cards, "AI 업로드용 md 파일", "markdown",
                                 lambda: self.open_file(self.markdown),
-                                lambda: self.markdown if self.job != "export" else None, self.send_markdown)
-        self.json_card = FileCard(cards, "AI의 편집 결과", "json", self.choose_json, lambda: None, None)
-        self.source_card.grid(row=0, column=0, sticky="ew", padx=(0, 7))
-        self.md_card.grid(row=0, column=1, sticky="ew", padx=7)
-        self.json_card.grid(row=0, column=2, sticky="ew", padx=(7, 0))
+                                lambda: self.markdown if self.job != "export" else None,
+                                self.send_markdown, fonts=self.fonts)
+        self.json_card = FileCard(cards, "AI가 편집한 JSON·ZIP 파일은 이곳에 업로드하세요", "json",
+                                 self.choose_json, lambda: None, None, fonts=self.fonts)
+        self.source_card.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.md_card.grid(row=0, column=1, sticky="ew", padx=3)
+        self.json_card.grid(row=0, column=2, sticky="ew", padx=(3, 0))
 
         self.result_card = FileCard(self.frame, "편집된 한글 파일", "result",
                                     lambda: self.open_file(self.output),
                                     lambda: self.output if self.job is None else None,
-                                    self.send_result, wide=True)
-        self.result_card.configure(width=455)
-        self.result_card.grid(row=2, column=0, pady=(0, 18))
+                                    self.send_result, fonts=self.fonts, wide=True)
+        self.result_card.grid(row=2, column=0, sticky="ew", pady=(0, 9))
         self.build_activity()
         root.report_callback_exception = self.callback_error
+        root.bind_all("<Control-v>", self.paste_json)
+        root.bind_all("<Control-V>", self.paste_json)
         self.refresh()
-        self.set_status("원본 한글 파일을 놓아 시작하세요.")
+        self.set_status("한컴 파일을 놓아 시작하세요. AI가 JSON을 글로만 보여 주면 복사한 뒤 Ctrl+V로 붙여 넣으세요.")
         root.update_idletasks()
+        minimum_height = max(440, self.frame.winfo_reqheight())
+        root.minsize(MIN_WIDTH, minimum_height)
+        if minimum_height > DEFAULT_HEIGHT:
+            root.geometry(f"{round(minimum_height * GOLDEN_RATIO)}x{minimum_height}")
         try:
             self.receiver = DropReceiver(root, self.on_drop)
         except (OSError, RuntimeError) as error:
@@ -224,39 +313,50 @@ class ConverterWindow:
         bar = tk.Frame(self.frame, background=BACKGROUND)
         bar.grid(row=0, column=0, sticky="ew")
         bar.columnconfigure(1, weight=1)
-        mark = tk.Canvas(bar, width=49, height=46, background=BACKGROUND, highlightthickness=0)
-        mark.grid(row=0, column=0, padx=(0, 11))
-        rounded(mark, 2, 2, 47, 44, 11, fill=ACCENT, outline="")
-        mark.create_text(24, 22, text="TR", font=("Malgun Gothic", 14, "bold"), fill=WHITE)
+        mark_width = max(46, self.fonts["mark"].measure("TR") + 27)
+        mark = tk.Canvas(bar, width=mark_width, height=42, background=BACKGROUND, highlightthickness=0)
+        mark.grid(row=0, column=0, padx=(0, 8))
+        self.mark_surface = clay_photo(mark, mark_width, 42, "#E5D5F3", outline=CARD_OUTLINE, radius=11)
+        mark.create_image(0, 0, image=self.mark_surface, anchor="nw")
+        mark.create_text(mark_width // 2, 21, text="TR", font=self.fonts["mark"], fill=ACCENT_DARK)
         tk.Label(bar, text="한글 문서 편집", bg=BACKGROUND, fg=TEXT,
-                 font=("Malgun Gothic", 22, "bold"), anchor="w").grid(row=0, column=1, sticky="ew")
-        self.project_button = tk.Button(
-            bar, text="프로젝트 폴더", command=lambda: self.open_file(self.project),
-            font=("Malgun Gothic", 10, "bold"), background=LAVENDER, foreground=ACCENT_DARK,
-            activebackground="#DAC9F5", activeforeground=TEXT, disabledforeground="#756989",
-            borderwidth=0, padx=14, pady=7, cursor="hand2", highlightthickness=0,
-        )
-        self.project_button.grid(row=0, column=2, sticky="e")
+                 font=self.fonts["heading"], anchor="w").grid(row=0, column=1, sticky="ew")
+        for column, (label, action) in enumerate(
+            (("JSON 붙여넣기", self.paste_json), ("작업 내역", self.open_history),
+             ("프로젝트 폴더", self.open_projects_folder)), start=2
+        ):
+            button = tk.Button(
+                bar, text=label, command=action, font=self.fonts["label"],
+                background=PAPER, foreground=TEXT, activebackground=LAVENDER, activeforeground=ACCENT_DARK,
+                borderwidth=0, padx=11, pady=4, cursor="hand2", highlightthickness=1,
+                highlightbackground=BORDER, highlightcolor=ACCENT, relief="flat",
+            )
+            button.grid(row=0, column=column, sticky="e", padx=(8, 0))
 
     def build_activity(self):
         panel = tk.Frame(self.frame, background=PAPER, highlightthickness=1, highlightbackground=BORDER,
-                         padx=14, pady=9)
-        panel.grid(row=3, column=0, sticky="nsew")
+                         padx=12, pady=7)
+        panel.grid(row=3, column=0, sticky="nsew", padx=8)
         panel.columnconfigure(0, weight=1)
         panel.rowconfigure(3, weight=1)
         tk.Label(panel, text="작업 기록", background=PAPER, foreground=TEXT,
-                 font=("Malgun Gothic", 11, "bold")).grid(row=0, column=0, sticky="w")
-        self.status = tk.Label(panel, background=PAPER, foreground=MUTED, font=("Malgun Gothic", 9),
-                               anchor="w", justify="left")
-        self.status.grid(row=1, column=0, sticky="ew", pady=(1, 6))
+                 font=self.fonts["label"]).grid(row=0, column=0, sticky="w")
+        self.status = tk.Label(panel, background=PAPER, foreground=MUTED, font=self.fonts["body"],
+                               anchor="nw", justify="left", height=2)
+        self.status.grid(row=1, column=0, sticky="ew", pady=(2, 5))
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("TR.Horizontal.TProgressbar", background="#9A77D7",
-                        troughcolor=LAVENDER, bordercolor=LAVENDER, lightcolor="#9A77D7", darkcolor="#9A77D7")
-        self.progress = ttk.Progressbar(panel, mode="determinate", style="TR.Horizontal.TProgressbar")
-        self.progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 7))
+        style.configure("TR.Horizontal.TProgressbar", background=ACCENT, thickness=4,
+                        troughcolor=LAVENDER, bordercolor=LAVENDER, lightcolor=ACCENT, darkcolor=ACCENT)
+        track = tk.Frame(panel, background=LAVENDER, height=5)
+        track.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        track.grid_propagate(False)
+        track.rowconfigure(0, weight=1)
+        track.columnconfigure(0, weight=1)
+        self.progress = ttk.Progressbar(track, mode="determinate", style="TR.Horizontal.TProgressbar")
+        self.progress.grid(sticky="nsew")
         self.log = tk.Text(panel, height=2, width=1, wrap="word", state="disabled",
-                           background=PAPER, foreground=MUTED, font=("Malgun Gothic", 9),
+                           background=PAPER, foreground=MUTED, font=self.fonts["hint"], spacing1=2, spacing3=3,
                            selectbackground=LAVENDER, selectforeground=TEXT, borderwidth=0,
                            highlightthickness=0, padx=2, pady=1)
         self.log.grid(row=3, column=0, sticky="nsew")
@@ -264,7 +364,8 @@ class ConverterWindow:
         self.log.tag_configure("error", foreground=ERROR)
         self.log.tag_configure("ok", foreground=SUCCESS)
         style.configure("TR.Vertical.TScrollbar", background=LAVENDER, troughcolor=PAPER,
-                        bordercolor=PAPER, arrowsize=12, arrowcolor=MUTED)
+                        bordercolor=PAPER, lightcolor=LAVENDER, darkcolor=LAVENDER,
+                        arrowsize=12, arrowcolor=MUTED)
         scroll = ttk.Scrollbar(panel, orient="vertical", command=self.log.yview,
                                style="TR.Vertical.TScrollbar")
         self.log.configure(yscrollcommand=scroll.set)
@@ -275,58 +376,123 @@ class ConverterWindow:
         idle = self.job is None
         markdown = self.md_card.get_path()
         result = self.result_card.get_path()
-        self.source_card.update_card(self.source_name or "HWP 또는 HWPX", "여기에 끌어놓기 · 클릭 선택", idle)
+        self.source_card.update_card(self.source_name or "HWP 또는 HWPX", "끌어놓기 · 클릭 선택", idle)
         md_placeholder = "AI용.md를 만드는 중입니다" if self.job == "export" else "원본을 놓으면 생성됩니다"
         self.md_card.update_card(markdown.name if markdown else md_placeholder,
-                                 "끌어서 AI에 첨부" if markdown else "Markdown", markdown is not None)
-        self.json_card.update_card("다운로드한 편집 JSON", "여기에 끌어놓기 · 클릭 선택", idle)
+                                 "끌어서 AI에 첨부" if markdown else "", markdown is not None)
+        self.json_card.update_card("편집.json · 편집.zip", "끌어놓기 · 클릭 · Ctrl+V", idle)
         result_placeholder = "편집본을 저장하는 중입니다" if self.job == "apply" else "편집 JSON을 놓으면 저장됩니다"
         self.result_card.update_card(result.name if result else result_placeholder,
-                                     "클릭하여 열기 · 끌어서 다른 폴더로" if result else "HWP 또는 HWPX",
+                                     "끌어서 다른 폴더로" if result else "",
                                      result is not None)
-        self.project_button.configure(state="normal" if self.project else "disabled")
 
     def choose_source(self):
-        selected = filedialog.askopenfilename(parent=self.root, title="원본 한글 파일",
+        selected = filedialog.askopenfilename(parent=self.root, title="한컴 파일 첨부",
                                                filetypes=[("한글 문서", "*.hwp *.hwpx")])
         if selected:
             self.on_drop((Path(selected),))
 
     def choose_json(self):
-        selected = filedialog.askopenfilename(parent=self.root, title="AI의 편집 결과",
-                                               filetypes=[("편집 지시", "*.json")])
+        selected = filedialog.askopenfilenames(
+            parent=self.root, title="AI가 편집한 JSON 파일 (그림도 함께 고를 수 있습니다)",
+            filetypes=[("편집 지시와 그림", "*.json *.zip *.txt *.png *.jpg *.jpeg"), ("모든 파일", "*.*")])
         if selected:
-            self.on_drop((Path(selected),))
+            self.on_drop(tuple(Path(item) for item in selected))
 
     def on_drop(self, paths, _x=None, _y=None):
         if self.job is not None:
             self.add_log("진행 중인 변환이 끝나면 다음 파일을 놓아 주세요.")
             return
-        if len(paths) != 1:
-            self.report_error("한 번에 한 파일을 놓아 주세요.")
+        paths = [Path(path) for path in paths]
+        if not paths:
             return
-        path = Path(paths[0])
-        if path.is_dir() and project_metadata(path):
-            self.select_project(path.resolve())
-            self.output = None
-            self.refresh()
-            self.set_status("기존 TR 프로젝트를 연결했습니다.", "ok")
-            self.add_log(str(self.project), "ok")
+        if len(paths) == 1 and paths[0].is_dir():
+            if project_metadata(paths[0]):
+                self.load_project(paths[0].resolve())
+            else:
+                self.report_error("TR 프로젝트 폴더가 아닙니다. 한컴 파일이나 편집 JSON을 놓아 주세요.")
             return
-        file_type = path.suffix.lower()
-        if file_type in FORMATS:
-            self.start("export", "원본을 읽고 바탕화면에 프로젝트를 만드는 중입니다.", export_dropped, path)
-        elif file_type == ".json":
-            self.start("apply", "편집 JSON을 적용하고 한글 파일을 저장하는 중입니다.", apply_dropped,
-                       path, self.project)
-        else:
-            self.report_error("원본 HWP/HWPX 또는 AI가 반환한 JSON 파일을 놓아 주세요.")
+        documents = [path for path in paths if path.suffix.lower() in FORMATS]
+        edits = [path for path in paths if path.suffix.lower() in EDIT_TYPES]
+        images = [path for path in paths if path.suffix.lower() in IMAGE_TYPES]
+        others = [path for path in paths if path not in documents + edits + images]
+        if others:
+            self.report_error(f"TR이 다룰 수 없는 파일입니다. {others[0].name}  "
+                              "한컴 파일, 편집 JSON·ZIP, PNG·JPEG 그림을 놓아 주세요.")
+        elif documents:
+            if len(paths) != 1:
+                self.report_error("한컴 파일은 한 번에 하나만 놓아 주세요.")
+            else:
+                self.start("export", "한컴 파일을 읽고 gpt 폴더에 프로젝트를 만드는 중입니다.",
+                           export_dropped, documents[0], label=documents[0].name)
+        elif edits:
+            if len(edits) != 1:
+                self.report_error("편집 JSON은 한 번에 하나만 놓아 주세요. 그림은 함께 놓아도 됩니다.")
+            else:
+                self.begin_apply(edits[0], images=images)
+        elif images:
+            self.add_project_images(images)
 
-    def start(self, kind, message, action, *args):
+    def add_project_images(self, images):
+        if self.project is None:
+            self.report_error("그림을 넣을 프로젝트가 없습니다. 먼저 한컴 파일을 놓거나 작업 내역에서 프로젝트를 여세요.")
+            return
+        try:
+            names = add_images(images, self.project)
+        except (OSError, ValueError) as error:
+            self.report_error(str(error))
+            return
+        self.set_status("그림을 프로젝트의 assets 폴더에 넣었습니다. AI에게 파일명을 알려 주세요.", "ok")
+        self.add_log(f"assets에 추가 · {', '.join(names)}", "ok")
+
+    def paste_json(self, _event=None):
+        if self.job is not None:
+            self.add_log("진행 중인 변환이 끝나면 붙여 넣어 주세요.")
+            return "break"
+        focus = self.root.focus_get()
+        if isinstance(focus, (tk.Entry, tk.Text)) and focus is not self.log:
+            return None
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            self.report_error("클립보드에 글이 없습니다. AI가 보여 준 JSON을 복사한 뒤 다시 붙여 넣어 주세요.")
+            return "break"
+        candidate = Path(text.strip().strip('"')) if len(text) < 1000 and "\n" not in text.strip() else None
+        try:
+            if candidate is not None and candidate.is_file():
+                self.on_drop((candidate,))
+                return "break"
+        except OSError:
+            pass
+        self.begin_apply(None, text=text)
+        return "break"
+
+    def begin_apply(self, path, *, text=None, images=()):
+        try:
+            pending = prepare_edit(path, text=text, images=images, active_project=self.project)
+        except (OSError, ValueError) as error:
+            self.report_error(str(error))
+            return
+        for name, note in pending.missing:
+            description = f" · {note}" if note else ""
+            self.set_status(f"편집에 필요한 그림 {name}이 없습니다. 이 자리에 넣을 그림을 골라 주세요.", "busy")
+            self.add_log(f"필요한 그림 {name}{description}")
+            selected = filedialog.askopenfilename(
+                parent=self.root, title=f"'{name}' 자리에 넣을 그림 선택{description}"[:200],
+                filetypes=[("그림", "*.png *.jpg *.jpeg")])
+            if selected:
+                pending.mapping[name] = Path(selected)
+                self.add_log(f"{name} ← {Path(selected).name}", "ok")
+            else:
+                self.add_log(f"{name}을 고르지 않았습니다. 이 그림 편집은 건너뜁니다.", "error")
+        label = pending.source_label
+        self.start("apply", "편집 JSON을 적용하고 한글 파일을 저장하는 중입니다.", finish_edit, pending, label=label)
+
+    def start(self, kind, message, action, *args, label=""):
         self.job = kind
         self.refresh()
         self.set_status(message, "busy")
-        self.add_log(f"{message}  {Path(args[0]).name}")
+        self.add_log(f"{message}  {label}")
         self.progress.configure(mode="indeterminate")
         self.progress.start(14)
 
@@ -357,15 +523,29 @@ class ConverterWindow:
         if kind == "export":
             project, detail = result
             self.select_project(project)
-            self.output = None
-            self.set_status("AI에 보낼 파일이 준비되었습니다.", "ok")
+            self.set_status("AI 업로드용 md 파일이 준비되었습니다.", "ok")
             self.add_log(f"{detail}  {project}", "ok")
         else:
-            project, self.output, detail = result
+            project, output, report, report_path = result
             self.select_project(project)
-            self.set_status("편집된 한글 파일을 저장했습니다.", "ok")
-            self.add_log(f"{detail}  {self.output}", "ok")
+            self.output = output
+            attention = bool(report.failures or report.unresolved)
+            self.set_status("편집된 한글 파일을 저장했습니다." + (" 건너뛴 편집이나 남은 지시를 확인하세요."
+                                                                if attention else ""), "busy" if attention else "ok")
+            self.add_log(f"{report}  {self.output}", "ok")
+            for note in report.notes:
+                self.add_log(f"AI 메모 · {note}")
+            for warning in report.warnings:
+                self.add_log(f"참고 · {warning}")
+            for number, _, error in report.failures:
+                self.add_log(f"{number}번째 편집 건너뜀 · {error}", "error")
+            for label, instruction in report.unresolved:
+                self.add_log(f"남은 지시 {label} · {instruction}", "error")
+            if report_path is not None:
+                self.add_log(f"적용 보고를 저장했습니다. AI에게 다시 보낼 메시지가 들어 있습니다.  {report_path}")
         self.refresh()
+        if self.history_window is not None and self.history_window.winfo_exists():
+            self.history_window.refresh_history(self.project)
 
     def select_project(self, project):
         self.project = project
@@ -373,7 +553,46 @@ class ConverterWindow:
         if not self.markdown.is_file():
             self.markdown = None
         meta = project_metadata(project) or {}
-        self.source_name = meta.get("source_name") or project.name
+        source_name = meta.get("source_name")
+        self.source_name = source_name if isinstance(source_name, str) and source_name else project.name
+        self.output = next(iter(project_outputs(project)), None)
+
+    def load_project(self, project):
+        if self.job is not None:
+            self.add_log("파일 처리가 끝나면 이전 프로젝트를 불러올 수 있습니다.")
+            return False
+        if not project_metadata(project):
+            self.report_error(f"프로젝트를 찾을 수 없습니다. {project}")
+            return False
+        self.select_project(project)
+        self.refresh()
+        self.set_status("이전 프로젝트를 불러왔습니다.", "ok")
+        self.add_log(str(project), "ok")
+        return True
+
+    def open_projects_folder(self):
+        directory = projects_folder()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            self.report_error(str(error))
+            return
+        self.open_file(directory)
+
+    def open_history(self):
+        if self.history_window is not None and self.history_window.winfo_exists():
+            self.history_window.refresh_history(self.project)
+            self.history_window.lift()
+            self.history_window.focus_set()
+            return
+        palette = {
+            "background": BACKGROUND, "paper": PAPER, "white": WHITE, "text": TEXT, "muted": MUTED,
+            "lavender": LAVENDER, "border": BORDER, "accent": ACCENT, "accent_dark": ACCENT_DARK,
+        }
+        self.history_window = show_project_history(
+            self.root, fonts=self.fonts, colors=palette, active_project=self.project,
+            load_project=self.load_project, open_file=self.open_file,
+        )
 
     def set_status(self, text, level="idle"):
         colors = {"idle": MUTED, "busy": ACCENT_DARK, "ok": SUCCESS, "error": ERROR}
@@ -434,6 +653,7 @@ class ConverterWindow:
         if self.job is not None:
             self.add_log("파일 처리가 끝나면 창을 닫을 수 있습니다.")
             return
+        self.progress.stop()
         if self.receiver is not None:
             self.receiver.close()
         self.root.destroy()

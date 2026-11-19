@@ -3,14 +3,14 @@
 from copy import deepcopy
 from xml.etree import ElementTree as ET
 
+from tr_core import CHARACTER_FIELDS, PARAGRAPH_FIELDS
+
 
 LAYOUT_FIELDS = {
     "set_columns": ({"target", "count"}, {"gap_mm", "direction"}),
     "set_page_layout": ({"target"}, {"width_mm", "height_mm", "margins_mm"}),
     "insert_section": ({"target"}, {"columns", "gap_mm"}),
-    "format_paragraph": (
-        {"target"}, {"align", "line_spacing_percent", "page_break", "column_break"}
-    ),
+    "format_paragraph": ({"target"}, PARAGRAPH_FIELDS | CHARACTER_FIELDS),
 }
 
 ALIGNMENTS = {
@@ -263,6 +263,13 @@ def format_paragraph(doc, operation):
     paragraph = doc.get(operation["target"], "paragraph")
     if not LAYOUT_FIELDS["format_paragraph"][1].intersection(operation):
         raise ValueError("format_paragraph에는 변경할 문단 서식을 지정해야 합니다.")
+    if PARAGRAPH_FIELDS.intersection(operation):
+        set_paragraph_format(doc, paragraph, operation)
+    if CHARACTER_FIELDS.intersection(operation):
+        doc.format_character_runs(paragraph, operation)
+
+
+def set_paragraph_format(doc, paragraph, operation):
     breaks = {}
     for field, attribute in (("page_break", "PageBreak"), ("column_break", "ColumnBreak")):
         if field in operation:
@@ -273,7 +280,8 @@ def format_paragraph(doc, operation):
     if all(breaks.get(name, paragraph.get(name)) == "true" for name in ("PageBreak", "ColumnBreak")):
         raise ValueError("한 문단에는 쪽 나눔과 단 나눔을 동시에 지정할 수 없습니다.")
     paragraph.attrib.update(breaks)
-    if "align" not in operation and "line_spacing_percent" not in operation:
+    paragraph_spacing = {"line_spacing_percent", "space_before_pt", "space_after_pt"}
+    if "align" not in operation and not paragraph_spacing.intersection(operation):
         return
 
     shapes = child_or_error(doc.root, "HEAD/MAPPINGTABLE/PARASHAPELIST")
@@ -284,14 +292,21 @@ def format_paragraph(doc, operation):
     updated = deepcopy(shape)
     if "align" in operation:
         updated.set("Align", choice(operation["align"], "align", ALIGNMENTS))
-    if "line_spacing_percent" in operation:
-        value = bounded_integer(operation["line_spacing_percent"], "line_spacing_percent", 0, 500)
+    if paragraph_spacing.intersection(operation):
         margin = updated.find("PARAMARGIN")
         if margin is None:
             margin = ET.Element("PARAMARGIN")
             updated.insert(0, margin)
-        margin.set("LineSpacingType", "Percent")
-        margin.set("LineSpacing", str(value))
+        if "line_spacing_percent" in operation:
+            value = bounded_integer(operation["line_spacing_percent"], "line_spacing_percent", 0, 500)
+            margin.set("LineSpacingType", "Percent")
+            margin.set("LineSpacing", str(value))
+        for name, attribute in (("space_before_pt", "Prev"), ("space_after_pt", "Next")):
+            if name in operation:
+                value = operation[name]
+                if type(value) not in (int, float) or not 0 <= value <= 1000:
+                    raise ValueError(f"{name} 값은 0~1000 pt 범위의 숫자여야 합니다.")
+                margin.set(attribute, str(round(value * 100)))
     for identifier, existing in native_shapes.items():
         updated.set("Id", identifier)
         if ET.tostring(updated) == ET.tostring(existing):
