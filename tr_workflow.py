@@ -4,6 +4,7 @@ import ctypes
 import json
 import re
 import shutil
+import tempfile
 import time
 import uuid
 import zipfile
@@ -26,7 +27,8 @@ IMAGE_LIMIT = 12 * 1024 * 1024
 DESKTOP_ID = uuid.UUID("B4BFCC3A-DB2C-424C-B029-7FE99A87C641")
 PROJECT_SUFFIX = re.compile(r"_TR(?: \(\d+\))?$", re.IGNORECASE)
 RESULT_SUFFIX = re.compile(r"_편집본(?: \(\d+\))?$", re.IGNORECASE)
-ACTIVITY_LABELS = {"export": "AI용.md 생성", "apply": "편집본 저장"}
+PDF_SUFFIX = "_PDF변환"
+ACTIVITY_LABELS = {"export": "AI용.md 생성", "apply": "편집본 저장", "pdf": "PDF 변환본 저장"}
 
 
 def desktop_folder():
@@ -73,21 +75,43 @@ def candidate_paths(folder, stem, marker, extension=""):
             yield path
 
 
-def export_dropped(source):
+def export_dropped(source, progress=None):
     source = Path(source).resolve()
+    if source.is_file() and source.suffix.lower() == ".pdf":
+        return export_pdf(source, progress)
     if not source.is_file() or source.suffix.lower() not in FORMATS:
-        raise ValueError("한글 문서(.hwp 또는 .hwpx) 파일을 놓아 주세요.")
+        raise ValueError("한글 문서(.hwp 또는 .hwpx) 또는 PDF 파일을 놓아 주세요.")
+    return create_project(source)
+
+
+def create_project(source, *, pdf_name=None):
+    stem = Path(pdf_name).stem if pdf_name else source.stem
+    converted_name = windows_filename(stem, PDF_SUFFIX + ".hwp") if pdf_name else None
+    pdf_origin = (pdf_name, converted_name) if converted_name else None
     folder = projects_folder()
     folder.mkdir(parents=True, exist_ok=True)
-    for project in candidate_paths(folder, source.stem, "_TR"):
+    for project in candidate_paths(folder, stem, "_TR"):
         try:
-            status = export_project(source, project)
+            status = export_project(source, project, pdf_origin=pdf_origin)
         except (FileExistsError, ValueError):
             if not project.exists():
                 raise
         else:
+            if converted_name:
+                record_activity(project, "pdf", converted_name)
             record_activity(project, "export", AI_DOCUMENT)
             return project, status
+
+
+def export_pdf(source, progress=None):
+    """Rebuild a PDF as a Hangul document, keep that HWP in the project, and export it."""
+    from tr_pdf import convert_pdf
+
+    with tempfile.TemporaryDirectory(prefix="tr-pdf-") as temporary:
+        converted = Path(temporary) / windows_filename(source.stem, ".hwp")
+        conversion = convert_pdf(source, converted, progress=progress)
+        project, status = create_project(converted, pdf_name=source.name)
+    return project, f"{conversion} {status}"
 
 
 def project_metadata(folder):
@@ -158,6 +182,16 @@ def project_outputs(project):
     return sorted(outputs, key=lambda path: (-outputs[path], path.name.casefold()))
 
 
+def pdf_conversion(project):
+    """Find the generated HWP using the PDF source saved in project metadata."""
+    meta = project_metadata(project) or {}
+    name = meta.get("pdf_name")
+    if not isinstance(name, str) or Path(name).name != name or Path(name).suffix.lower() != ".pdf":
+        return None
+    path = Path(project) / windows_filename(Path(name).stem, PDF_SUFFIX + ".hwp")
+    return path if path.is_file() else None
+
+
 def record_activity(project, kind, filename):
     """Keep a project event without affecting the already-saved output."""
     folder = project / LOCAL / "activity"
@@ -175,8 +209,9 @@ def project_activity(project):
     """List recorded activity, including files since moved out of the project."""
     project = Path(project)
     folder = project / LOCAL / "activity"
-    live = {path.name.casefold(): path for path in [project / AI_DOCUMENT, *project_outputs(project)]
-            if path.is_file()}
+    converted = pdf_conversion(project)
+    live = {path.name.casefold(): path for path in [project / AI_DOCUMENT, converted, *project_outputs(project)]
+            if path is not None and path.is_file()}
     try:
         records = list(folder.glob("*.json"))
     except OSError:
@@ -209,7 +244,8 @@ def project_activity(project):
             date = datetime.fromtimestamp(path.stat().st_mtime)
         except (OSError, ValueError, OverflowError):
             continue
-        label = ACTIVITY_LABELS["export"] if path.name == AI_DOCUMENT else f'{ACTIVITY_LABELS["apply"]} · {path.name}'
+        kind = "pdf" if path == converted else "apply"
+        label = ACTIVITY_LABELS["export"] if path.name == AI_DOCUMENT else f"{ACTIVITY_LABELS[kind]} · {path.name}"
         result.append((date, label, path))
     return sorted(result, key=lambda event: event[0], reverse=True)
 

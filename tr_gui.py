@@ -2,6 +2,7 @@
 
 import os
 import queue
+import shutil
 import threading
 import tkinter as tk
 import traceback
@@ -13,8 +14,8 @@ from tr_core import AI_DOCUMENT, FORMATS
 from tr_drag import DropReceiver, drag_file
 from tr_history import show_project_history
 from tr_surface import clay_photo
-from tr_workflow import (EDIT_TYPES, IMAGE_TYPES, add_images, export_dropped, finish_edit, prepare_edit,
-                         project_metadata, project_outputs, projects_folder)
+from tr_workflow import (EDIT_TYPES, IMAGE_TYPES, add_images, export_dropped, finish_edit,
+                         pdf_conversion, prepare_edit, project_metadata, project_outputs, projects_folder)
 
 
 BACKGROUND = "#ECE4F0"
@@ -64,12 +65,15 @@ def rounded(canvas, x0, y0, x1, y1, radius, **options):
 
 
 class FileCard(tk.Canvas):
-    def __init__(self, parent, title, kind, click, get_path, drag, *, fonts, wide=False):
+    def __init__(self, parent, title, kind, click, get_path, drag, *, fonts, wide=False, save=None):
         title_line = fonts["card"].metrics("linespace")
         height = max(84, 3 * title_line + 21) if wide else max(153, 101 + 4 * title_line)
         super().__init__(parent, background=BACKGROUND, height=height,
                          highlightthickness=0, borderwidth=0, takefocus=True)
         self.title = title
+        self.save = save             # wide card: a second button that saves the file elsewhere
+        self.save_area = None
+        self.open_label = "편집본 열기"
         self.kind = kind
         self.click = click
         self.get_path = get_path
@@ -138,6 +142,11 @@ class FileCard(tk.Canvas):
     def mouse_up(self, event):
         pressed = self.press is not None
         self.press = None
+        if pressed and self.save_area is not None:
+            left, top, right, bottom = self.save_area
+            if left <= event.x <= right and top <= event.y <= bottom:
+                self.save()
+                return
         if pressed and 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height():
             self.activate()
 
@@ -151,7 +160,7 @@ class FileCard(tk.Canvas):
             return self.detail
         # Keep the recognizable file extension when filenames are long.
         suffix = Path(self.detail).suffix
-        tail = "…" + (suffix if suffix.lower() in FORMATS | {".md", ".json"} else "")
+        tail = "…" + (suffix if suffix.lower() in FORMATS | {".md", ".json", ".pdf"} else "")
         for length in range(len(self.detail) - 1, 0, -1):
             clipped = self.detail[:length].rstrip() + tail
             if self.detail_font.measure(clipped) <= width:
@@ -206,19 +215,28 @@ class FileCard(tk.Canvas):
         self.create_text(62, title_y, text=self.title, font=self.fonts["card"],
                          fill=TEXT, anchor="nw", tags=("title",))
         detail_y = title_y + title_line + 4
-        button_text = "편집본 열기"
-        reserved = self.fonts["label"].measure(button_text) + 60 if ready else 24
+        button_text = self.open_label
+        save_text = "한글 파일 저장"
+        open_width = self.fonts["label"].measure(button_text) + 36
+        save_width = self.fonts["label"].measure(save_text) + 36 if self.save is not None else 0
+        reserved = open_width + (save_width + 8 if save_width else 0) + 24 if ready else 24
         self.create_text(62, detail_y, text=self.fit_detail(width - 62 - reserved),
                          font=self.detail_font, fill=TEXT if ready else MUTED, anchor="nw", tags=("detail",))
+        self.save_area = None
         if ready:
             self.create_text(62, detail_y + self.detail_font.metrics("linespace") + 3,
                              text=self.hint, font=self.fonts["hint"], fill=MUTED, anchor="nw", tags=("hint",))
-            button_left = width - reserved + 10
             half_height = self.fonts["label"].metrics("linespace") // 2 + 7
-            rounded(self, button_left, y - half_height, width - 23, y + half_height,
-                    11, fill=WHITE, outline=CARD_OUTLINE)
-            self.create_text((button_left + width - 23) // 2, y, text=button_text,
-                             font=self.fonts["label"], fill=ACCENT_DARK)
+            right = width - 23
+            for text, size, primary in ((button_text, open_width, True), (save_text, save_width, False)):
+                if not size:
+                    continue
+                rounded(self, right - size, y - half_height, right, y + half_height,
+                        11, fill=WHITE if primary else "#F8EFFC", outline=CARD_OUTLINE)
+                self.create_text(right - size // 2, y, text=text, font=self.fonts["label"], fill=ACCENT_DARK)
+                if not primary:
+                    self.save_area = (right - size, y - half_height, right, y + half_height)
+                right -= size + 8
 
     def draw_icon(self, x, y, ready):
         ink = ACCENT_DARK if ready else ACCENT
@@ -250,9 +268,11 @@ class ConverterWindow:
         self.project = None
         self.markdown = None
         self.output = None
+        self.converted_pdf = None
         self.source_name = None
         self.job = None
         self.results = queue.SimpleQueue()
+        self.progress_notes = queue.SimpleQueue()   # messages from the worker thread
         self.receiver = None
         self.history_window = None
         self.fonts = screen_fonts(root)
@@ -275,7 +295,7 @@ class ConverterWindow:
         cards.grid(row=1, column=0, sticky="ew", pady=(10, 6))
         for index in range(3):
             cards.columnconfigure(index, weight=1, uniform="workflow")
-        self.source_card = FileCard(cards, "한컴 파일을 이곳에 첨부하세요", "source",
+        self.source_card = FileCard(cards, "파일을 이곳에 첨부하세요", "source",
                                    self.choose_source, lambda: None, None, fonts=self.fonts)
         self.md_card = FileCard(cards, "AI 업로드용 md 파일", "markdown",
                                 lambda: self.open_file(self.markdown),
@@ -290,7 +310,7 @@ class ConverterWindow:
         self.result_card = FileCard(self.frame, "편집된 한글 파일", "result",
                                     lambda: self.open_file(self.output),
                                     lambda: self.output if self.job is None else None,
-                                    self.send_result, fonts=self.fonts, wide=True)
+                                    self.send_result, fonts=self.fonts, wide=True, save=self.save_result)
         self.result_card.grid(row=2, column=0, sticky="ew", pady=(0, 9))
         self.build_activity()
         root.report_callback_exception = self.callback_error
@@ -376,19 +396,23 @@ class ConverterWindow:
         idle = self.job is None
         markdown = self.md_card.get_path()
         result = self.result_card.get_path()
-        self.source_card.update_card(self.source_name or "HWP 또는 HWPX", "끌어놓기 · 클릭 선택", idle)
+        self.source_card.update_card(self.source_name or "HWP · HWPX · PDF", "끌어놓기 · 클릭 선택", idle)
         md_placeholder = "AI용.md를 만드는 중입니다" if self.job == "export" else "원본을 놓으면 생성됩니다"
         self.md_card.update_card(markdown.name if markdown else md_placeholder,
                                  "끌어서 AI에 첨부" if markdown else "", markdown is not None)
         self.json_card.update_card("편집.json · 편집.zip", "끌어놓기 · 클릭 · Ctrl+V", idle)
         result_placeholder = "편집본을 저장하는 중입니다" if self.job == "apply" else "편집 JSON을 놓으면 저장됩니다"
+        converted = result is not None and result == self.converted_pdf
+        self.result_card.title = "PDF에서 변환한 한글 파일" if converted else "편집된 한글 파일"
+        self.result_card.open_label = "한글에서 열기" if converted else "편집본 열기"
         self.result_card.update_card(result.name if result else result_placeholder,
-                                     "끌어서 다른 폴더로" if result else "",
+                                     "끌어서 다른 폴더로 · AI로 고치려면 위의 AI용.md를 첨부" if converted
+                                     else "끌어서 다른 폴더로" if result else "",
                                      result is not None)
 
     def choose_source(self):
-        selected = filedialog.askopenfilename(parent=self.root, title="한컴 파일 첨부",
-                                               filetypes=[("한글 문서", "*.hwp *.hwpx")])
+        selected = filedialog.askopenfilename(parent=self.root, title="원본 파일 첨부",
+                                               filetypes=[("한글 문서 또는 PDF", "*.hwp *.hwpx *.pdf")])
         if selected:
             self.on_drop((Path(selected),))
 
@@ -412,16 +436,20 @@ class ConverterWindow:
             else:
                 self.report_error("TR 프로젝트 폴더가 아닙니다. 한컴 파일이나 편집 JSON을 놓아 주세요.")
             return
-        documents = [path for path in paths if path.suffix.lower() in FORMATS]
+        documents = [path for path in paths if path.suffix.lower() in FORMATS | {".pdf"}]
         edits = [path for path in paths if path.suffix.lower() in EDIT_TYPES]
         images = [path for path in paths if path.suffix.lower() in IMAGE_TYPES]
         others = [path for path in paths if path not in documents + edits + images]
         if others:
             self.report_error(f"TR이 다룰 수 없는 파일입니다. {others[0].name}  "
-                              "한컴 파일, 편집 JSON·ZIP, PNG·JPEG 그림을 놓아 주세요.")
+                              "한컴 파일·PDF, 편집 JSON·ZIP, PNG·JPEG 그림을 놓아 주세요.")
         elif documents:
             if len(paths) != 1:
-                self.report_error("한컴 파일은 한 번에 하나만 놓아 주세요.")
+                self.report_error("한글 문서와 PDF는 한 번에 하나만 놓아 주세요.")
+            elif documents[0].suffix.lower() == ".pdf":
+                self.start("export", "PDF를 한글 파일로 바꾸는 중입니다. 쪽마다 원본과 맞춰 보느라 "
+                           "40쪽에 2~3분 정도 걸립니다.",
+                           export_dropped, documents[0], self.progress_notes.put, label=documents[0].name)
             else:
                 self.start("export", "한컴 파일을 읽고 gpt 폴더에 프로젝트를 만드는 중입니다.",
                            export_dropped, documents[0], label=documents[0].name)
@@ -508,6 +536,14 @@ class ConverterWindow:
         self.root.after(60, self.check_result)
 
     def check_result(self):
+        note = None
+        while True:
+            try:
+                note = self.progress_notes.get_nowait()
+            except queue.Empty:
+                break
+        if note:
+            self.set_status(note, "busy")
         try:
             result, error = self.results.get_nowait()
         except queue.Empty:
@@ -523,7 +559,11 @@ class ConverterWindow:
         if kind == "export":
             project, detail = result
             self.select_project(project)
-            self.set_status("AI 업로드용 md 파일이 준비되었습니다.", "ok")
+            if self.converted_pdf is not None:
+                self.set_status("PDF를 한글 파일로 바꿨습니다. 아래 카드에서 열거나 저장하세요. "
+                                "AI로 고치려면 AI용.md를 첨부하세요.", "ok")
+            else:
+                self.set_status("AI 업로드용 md 파일이 준비되었습니다.", "ok")
             self.add_log(f"{detail}  {project}", "ok")
         else:
             project, output, report, report_path = result
@@ -553,9 +593,10 @@ class ConverterWindow:
         if not self.markdown.is_file():
             self.markdown = None
         meta = project_metadata(project) or {}
-        source_name = meta.get("source_name")
+        source_name = meta.get("pdf_name") or meta.get("source_name")
         self.source_name = source_name if isinstance(source_name, str) and source_name else project.name
-        self.output = next(iter(project_outputs(project)), None)
+        self.converted_pdf = pdf_conversion(project)
+        self.output = next(iter(project_outputs(project)), None) or self.converted_pdf
 
     def load_project(self, project):
         if self.job is not None:
@@ -636,8 +677,34 @@ class ConverterWindow:
         if self.send_file(path, allow_move=True) == "move":
             self.output = None
             self.refresh()
-            self.set_status("편집본을 프로젝트 밖으로 이동했습니다.", "ok")
+            self.set_status("결과 파일을 프로젝트 밖으로 이동했습니다.", "ok")
             self.add_log(f"이동 후 프로젝트 폴더에서 빠진 파일 · {path.name}", "ok")
+
+    def save_result(self):
+        """Save a copy of the result (a PDF conversion or an edited file) wherever the user picks."""
+        if self.output is None or self.job is not None:
+            return
+        source = self.output
+        name = source.name
+        if source == self.converted_pdf:
+            name = Path(self.source_name).with_suffix(".hwp").name
+        extension = source.suffix.lower()
+        selected = filedialog.asksaveasfilename(
+            parent=self.root, title="한글 파일 저장", initialfile=name, defaultextension=extension,
+            initialdir=str(Path.home() / "Downloads") if (Path.home() / "Downloads").is_dir() else None,
+            filetypes=[("한글 문서", f"*{extension}")])
+        if not selected:
+            return
+        target = Path(selected)
+        try:
+            if target.resolve() == source.resolve():
+                return
+            shutil.copyfile(source, target)
+        except OSError as error:
+            self.report_error(str(error))
+            return
+        self.set_status("한글 파일을 저장했습니다.", "ok")
+        self.add_log(f"저장 · {target}", "ok")
 
     def send_file(self, path, *, allow_move):
         try:

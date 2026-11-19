@@ -605,6 +605,10 @@ class Document:
                 if size is not None:
                     record["size_mm"] = [round(int(size.get(key, "0")) * 25.4 / 7200, 2)
                                          for key in ("Width", "Height")]
+                # 개체 설명: what a picture stands for, e.g. the [A] mark of a PDF conversion.
+                comment = (element.findtext("SHAPEOBJECT/SHAPECOMMENT") or "").strip()
+                if comment:
+                    record["description"] = comment
             if category in {"table", "picture", "object"}:
                 record["deletable"] = can_delete_object(element, parent)
             yield record
@@ -641,7 +645,7 @@ def hancom(mode, source, output, pdf=None, verify_xml=None):
         raise RuntimeError(detail or "한컴에서 변환 파일을 만들지 못했습니다.")
 
 
-def export_project(source, project):
+def export_project(source, project, *, pdf_origin=None):
     source, project = Path(source).resolve(strict=True), Path(project).resolve()
     if not source.is_file() or source.suffix.lower() not in FORMATS:
         raise ValueError(".hwp 또는 .hwpx 파일을 선택하세요.")
@@ -665,10 +669,15 @@ def export_project(source, project):
             shutil.copyfile(native / "preview.pdf", staged / PREVIEW)
         document = Document.read(xml, project)
         project_id = str(uuid.uuid4())
-        write_json(local / "project.json", {
+        metadata = {
             "version": 1, "project_id": project_id, "format": source.suffix.lower(), "source_name": source.name,
             "snapshot_sha256": file_hash(snapshot), "xml_sha256": file_hash(xml),
-        })
+        }
+        if pdf_origin is not None:
+            pdf_name, converted_name = pdf_origin
+            metadata["pdf_name"] = pdf_name
+            shutil.copyfile(snapshot, staged / converted_name)
+        write_json(local / "project.json", metadata)
         write_ai_document(staged / AI_DOCUMENT, document, project_id)
         if project.is_dir() and not any(project.iterdir()):
             project.rmdir()

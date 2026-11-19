@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('export', 'build')]
+    [ValidateSet('export', 'build', 'blank')]
     [string]$Mode,
     [Parameter(Mandatory = $true)]
     [string]$Source,
@@ -63,7 +63,7 @@ $locked = $false
 $exitCode = 0
 try {
     $Source = [IO.Path]::GetFullPath($Source)
-    if (-not [IO.File]::Exists($Source)) { throw "Source not found: $Source" }
+    if ($Mode -ne 'blank' -and -not [IO.File]::Exists($Source)) { throw "Source not found: $Source" }
     $Output = Get-NewPath $Output
     if ($Pdf) { $Pdf = Get-NewPath $Pdf }
     if ($VerifyXml) { $VerifyXml = Get-NewPath $VerifyXml }
@@ -96,7 +96,10 @@ try {
     if (-not $locked) { throw 'Hancom is busy with another TR conversion.' }
 
     $hwp = New-Object -ComObject 'HWPFrame.HwpObject'
-    if ($Mode -eq 'export') {
+    if ($Mode -eq 'blank') {
+        # A new empty document, used as the template for PDF conversion.
+        Write-Hml $hwp $Output
+    } elseif ($Mode -eq 'export') {
         if ($sourceExtension -eq '.hwp') {
             Open-Hwp $hwp $Source
         } else {

@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+tr_lib/
 .tr/
 *_TR/
 *_TR (*/
@@ -8,6 +9,6 @@ TR 실험/
 *.hwp
 *.hwpx
 *.hml
+*.pdf
 AI용.md
-원본보기.pdf
 편집.json
