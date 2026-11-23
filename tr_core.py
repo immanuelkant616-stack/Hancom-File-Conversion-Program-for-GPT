@@ -33,14 +33,15 @@ OBJECTS = {
 PREFIXES = {"P": ("P", "paragraph"), "SECTION": ("S", "section"),
             "COLDEF": ("C", "columns"), "TABLE": ("T", "table"),
             "PICTURE": ("I", "picture")}
-CHARACTER_FIELDS = {"bold", "italic", "size_pt", "color", "font"}
+CHARACTER_FIELDS = {"bold", "italic", "size_pt", "color", "font", "highlight"}
+NO_SHADE = 0xFFFFFFFF
 PARAGRAPH_FIELDS = {"align", "line_spacing_percent", "space_before_pt", "space_after_pt",
                     "page_break", "column_break"}
 INSERT_FIELDS = PARAGRAPH_FIELDS | CHARACTER_FIELDS | {"position", "style_from"}
 TEXT_FIELDS = {
     "replace_text": ({"target", "old", "new"}, set()),
     "replace_all": ({"old", "new"}, set()),
-    "format_text": ({"target", "text"}, CHARACTER_FIELDS),
+    "format_text": ({"target", "text"}, CHARACTER_FIELDS | {"occurrence"}),
     "insert_paragraph": ({"target", "text"}, INSERT_FIELDS | {"id"}),
     "insert_paragraphs": ({"target", "texts"}, INSERT_FIELDS | {"ids"}),
     "delete_paragraph": ({"target"}, set()),
@@ -138,12 +139,15 @@ def selection_pieces(group, start, length):
     return pieces
 
 
-def text_selection(paragraph, phrase):
+def text_selection(paragraph, phrase, occurrence=None):
     matches = text_matches(paragraph, phrase)
-    if len(matches) != 1:
+    if occurrence is not None:
+        if not 1 <= occurrence <= len(matches):
+            raise ValueError(f"occurrence에 해당하는 문구가 없습니다. 발견 {len(matches)}회.")
+    elif len(matches) != 1:
         hint = " 문서 전체에서 바꾸려면 replace_all을 사용하세요." if matches else ""
         raise ValueError(f"바꿀 문구가 문단의 연속된 텍스트에서 한 번 나와야 합니다. 발견 {len(matches)}회.{hint}")
-    group, start = matches[0]
+    group, start = matches[(occurrence or 1) - 1]
     return selection_pieces(group, start, len(phrase))
 
 
@@ -421,7 +425,10 @@ class Document:
         return remaining
 
     def format_text(self, paragraph, operation):
-        selection = list(text_selection(paragraph, require_text(operation["text"], "text")))
+        occurrence = operation.get("occurrence")
+        if "occurrence" in operation and (type(occurrence) is not int or occurrence < 1):
+            raise ValueError("occurrence에는 1부터 시작하는 정수를 입력하세요.")
+        selection = text_selection(paragraph, require_text(operation["text"], "text"), occurrence)
         self.format_character_selection(paragraph, selection, operation)
 
     def format_character_runs(self, paragraph, operation):
@@ -468,11 +475,17 @@ class Document:
             if type(size) not in (int, float) or not 1 <= size <= 1000:
                 raise ValueError("size_pt는 1~1000 사이 숫자여야 합니다.")
             attributes["Height"] = str(round(size * 100))
-        if "color" in operation:
-            color = operation["color"]
+        for field, attribute in (("color", "TextColor"), ("highlight", "ShadeColor")):
+            if field not in operation:
+                continue
+            color = operation[field]
+            if field == "highlight" and color is None:
+                attributes[attribute] = str(NO_SHADE)
+                continue
             if not isinstance(color, str) or re.fullmatch("#[0-9a-fA-F]{6}", color) is None:
-                raise ValueError("color는 #RRGGBB 형식이어야 합니다.")
-            attributes["TextColor"] = str(int.from_bytes(bytes.fromhex(color[1:]), "little"))
+                allowed = "#RRGGBB 색상 또는 null(강조 제거)" if field == "highlight" else "#RRGGBB 색상"
+                raise ValueError(f"{field}에는 {allowed}을 입력하세요.")
+            attributes[attribute] = str(int.from_bytes(bytes.fromhex(color[1:]), "little"))
         fonts = self.font_references(operation["font"]) if "font" in operation else {}
         styles = self.root.find("HEAD/MAPPINGTABLE/CHARSHAPELIST")
         if styles is None:
@@ -874,7 +887,28 @@ def normalize_request(request):
     return operations, notes, warnings
 
 
-def check_native(expected, actual):
+def _shade_runs(document):
+    """Read each paragraph's background spans independently of native style IDs and run splits."""
+    shades = {style.get("Id"): int(style.get("ShadeColor", str(NO_SHADE))) & NO_SHADE
+              for style in document.root.findall("HEAD/MAPPINGTABLE/CHARSHAPELIST/CHARSHAPE")}
+    paragraphs = []
+    for paragraph in document.body.iter("P"):
+        spans = []
+        for run in paragraph.findall("TEXT"):
+            length = sum(len(char_value(char)) for char in run.findall("CHAR"))
+            if not length:
+                continue
+            shade = shades.get(run.get("CharShape", "0"), NO_SHADE)
+            if spans and spans[-1][0] == shade:
+                spans[-1][1] += length
+            else:
+                spans.append([shade, length])
+        if spans:
+            paragraphs.append(spans)
+    return paragraphs
+
+
+def check_native(expected, actual, *, verify_highlights=False):
     # The native writer may renumber styles and omit empty text runs.
     def signature(document):
         return (
@@ -892,6 +926,8 @@ def check_native(expected, actual):
                        zip(("문서 요소 수", "문단 텍스트", "단 설정", "표 크기"), want, got)
                        if before != after]
         raise RuntimeError(f"한글 저장 후 구조가 달라졌습니다. {', '.join(differences)}. 결과를 게시하지 않았습니다.")
+    if verify_highlights and _shade_runs(expected) != _shade_runs(actual):
+        raise RuntimeError("한글 저장 후 글자 배경색이나 적용 범위가 달라져 결과를 저장하지 않았습니다.")
 
 
 def check_file_format(path):
@@ -954,7 +990,8 @@ def apply_project(project, edits, output, *, pdf=None, strict=False):
             ET.ElementTree(document.root).write(hml, encoding="utf-8", xml_declaration=True)
             verified = folder / "verify.xml"
             hancom("build", hml, staged, stage_pdf, verified)
-            check_native(document, Document.read(verified, project))
+            verify_highlights = any(isinstance(op, dict) and "highlight" in op for op in operations)
+            check_native(document, Document.read(verified, project), verify_highlights=verify_highlights)
         check_file_format(staged)
         publish_file(staged, output)
         if pdf is not None:

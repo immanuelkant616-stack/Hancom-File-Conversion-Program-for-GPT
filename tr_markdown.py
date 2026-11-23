@@ -4,6 +4,7 @@ import re
 from collections import defaultdict
 from html import escape
 
+from tr_core import NO_SHADE
 
 _MARKDOWN_PUNCTUATION = re.compile(r"[\\|`*_~\[\]{}!]")
 _ALIGNMENTS = {
@@ -142,6 +143,10 @@ def _fonts(mapping):
     }
 
 
+def _rgb(color):
+    return "#" + (color & 0xFFFFFF).to_bytes(3, "little").hex().upper()
+
+
 def _character_style(shape, fonts):
     font_ids = shape.find("./FONTID")
     faces = []
@@ -154,9 +159,10 @@ def _character_style(shape, fonts):
     styles = ", ".join(label for tag, label in (("BOLD", "굵게"), ("ITALIC", "기울임"),
                                                ("UNDERLINE", "밑줄"), ("SUPERSCRIPT", "위 첨자"),
                                                ("SUBSCRIPT", "아래 첨자")) if shape.find(tag) is not None)
-    color = _int(shape, "TextColor") & 0xFFFFFF
-    rgb = f"#{color & 255:02X}{color >> 8 & 255:02X}{color >> 16 & 255:02X}"
-    return (*map(_literal, faces), f"{_int(shape, 'Height', 1000) / 100:g}", styles or "–", rgb)
+    color = _rgb(_int(shape, "TextColor"))
+    shade = _int(shape, "ShadeColor", NO_SHADE) & NO_SHADE
+    background = "–" if shade == NO_SHADE else _rgb(shade)
+    return (*map(_literal, faces), f"{_int(shape, 'Height', 1000) / 100:g}", styles or "–", color, background)
 
 
 def _paragraph_style(shape):
@@ -200,7 +206,7 @@ def _write_styles(stream, document):
     stream.write("## 서식 색인\n\n")
     _write_used_styles(stream, mapping.findall("./CHARSHAPELIST/CHARSHAPE"), chars,
                        lambda shape: _character_style(shape, fonts),
-                       ["글자 모양 ID", "한글 글꼴", "영문 글꼴", "크기 (pt)", "효과", "색"])
+                       ["글자 모양 ID", "한글 글꼴", "영문 글꼴", "크기 (pt)", "효과", "글자색", "글자 배경색"])
     _write_used_styles(stream, mapping.findall("./PARASHAPELIST/PARASHAPE"), paras, _paragraph_style,
                        ["문단 모양 ID", "정렬", "줄 간격", "첫 줄 들여쓰기", "문단 앞 / 뒤 (pt)"])
     _write_used_styles(stream, mapping.findall("./STYLELIST/STYLE"), styles,

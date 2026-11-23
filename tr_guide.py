@@ -51,11 +51,12 @@ TR은 언제나 **처음 내보낸 원본**에 JSON을 적용합니다. 같은 �
 글과 문단
 - `replace_text` — `target`(P), `old`, `new`. 원래 문구가 그 문단에 정확히 한 번 나와야 합니다. `new`가 빈 문자열이면 지웁니다. 새 문자열은 원래 문구 첫 글자의 서식을 씁니다.
 - `replace_all` — `old`, `new`. 문서 전체에서 같은 문구를 모두 바꿉니다. 한 번도 없으면 실패합니다.
-- `format_text` — `target`(P), `text`(그 문단에 정확히 한 번 나오는 원래 문구), 선택 `font`(글꼴 이름), `bold`, `italic`(참/거짓), `size_pt`, `color`(`#RRGGBB`).
+- `format_text` — `target`(P), `text`(원래 문구), 선택 `occurrence`(문단 안에서 앞부터 센 일치 순서, 1부터 시작, 생략하면 정확히 한 번만 일치해야 함), `font`(글꼴 이름), `bold`, `italic`(참/거짓), `size_pt`, `color`(글자색 `#RRGGBB`), `highlight`(형광펜처럼 글자 뒤에 들어가는 배경색 `#RRGGBB`, 제거는 `null`).
+- 사진 속 형광펜을 옮겨 달라는 요청에는 `format_text`의 `highlight`를 쓰세요. 문서 데이터에서 칠해진 문구에 해당하는 정확한 `text`와 문단 ID를 찾고, 색과 범위를 각각 유지하세요. 예를 들어 초록은 `#C6EF63`, 주황은 `#FFB45C`입니다. 여러 문단에 걸친 표시는 문단별 명령으로 나누고, 한 문단에서 같은 문구가 반복되면 `occurrence`를 지정하세요. 기존 글자 모양을 유지하려면 `bold`와 `color`는 생략하세요.
 - `insert_paragraph` — `target`(P), `text`, 선택 `position`(`before`/`after`, 기본 `after`), `style_from`(모양을 본뜰 P), `id`(새 문단 이름), 문단·글자 서식(`format_paragraph`와 같은 키).
 - `insert_paragraphs` — `target`(P), `texts`(문단 문자열 배열, 적힌 순서대로 들어감), 선택 `position`, `style_from`, `ids`(texts와 같은 길이의 이름 배열), 문단·글자 서식.
 - `delete_paragraph` — `target`(P). 문단과 그 안의 개체를 지웁니다. 구역/단 설정 문단과 셀의 마지막 문단은 보호됩니다.
-- `format_paragraph` — `target`(P), 선택 `align`(`left`, `center`, `right`, `justify`, `distribute`, `distribute_space`), `line_spacing_percent`, `space_before_pt`, `space_after_pt`, `page_break`·`column_break`(참/거짓), 그리고 문단 전체 글자에 `font`, `bold`, `italic`, `size_pt`, `color`.
+- `format_paragraph` — `target`(P), 선택 `align`(`left`, `center`, `right`, `justify`, `distribute`, `distribute_space`), `line_spacing_percent`, `space_before_pt`, `space_after_pt`, `page_break`·`column_break`(참/거짓), 그리고 문단 전체 글자에 `font`, `bold`, `italic`, `size_pt`, `color`, `highlight`.
 - `remove_directive` — `target`(D), 선택 `replacement`(지시 자리에 넣을 문구), `style_from`(지시만 있던 문단에 입힐 본보기 P). 지시 문구 `[[…]]`를 지우거나 바꿉니다.
 
 조판
