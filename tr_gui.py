@@ -15,7 +15,8 @@ from tr_drag import DropReceiver, drag_file
 from tr_history import show_project_history
 from tr_surface import clay_photo
 from tr_workflow import (EDIT_TYPES, IMAGE_TYPES, add_images, export_dropped, finish_edit,
-                         pdf_conversion, prepare_edit, project_metadata, project_outputs, projects_folder)
+                         pdf_conversion, prepare_edit, project_metadata, project_outputs, projects_folder,
+                         text_document)
 
 
 BACKGROUND = "#ECE4F0"
@@ -41,6 +42,11 @@ CARD_COLORS = {
     "json": "#E9E5F8",
     "result": "#F2E6F6",
 }
+# The small '텍스트 파일' button inside the md card: a cool blue so it reads apart from the card.
+EXTRA_FILL = "#E2E8FA"
+EXTRA_HOVER = "#D2DCF7"
+EXTRA_OUTLINE = "#8F9DD0"
+EXTRA_TEXT = "#3B4A86"
 
 
 def screen_fonts(root):
@@ -65,7 +71,8 @@ def rounded(canvas, x0, y0, x1, y1, radius, **options):
 
 
 class FileCard(tk.Canvas):
-    def __init__(self, parent, title, kind, click, get_path, drag, *, fonts, wide=False, save=None):
+    def __init__(self, parent, title, kind, click, get_path, drag, *, fonts, wide=False, save=None,
+                 extra=None):
         title_line = fonts["card"].metrics("linespace")
         height = max(84, 3 * title_line + 21) if wide else max(153, 101 + 4 * title_line)
         super().__init__(parent, background=BACKGROUND, height=height,
@@ -73,6 +80,11 @@ class FileCard(tk.Canvas):
         self.title = title
         self.save = save             # wide card: a second button that saves the file elsewhere
         self.save_area = None
+        # Small card: a corner button for a second file, (label, get_path, click, drag).
+        self.extra = extra
+        self.extra_area = None
+        self.extra_hover = False
+        self.press_extra = False
         self.open_label = "편집본 열기"
         self.kind = kind
         self.click = click
@@ -98,6 +110,7 @@ class FileCard(tk.Canvas):
         self.bind("<ButtonPress-1>", self.mouse_down)
         self.bind("<B1-Motion>", self.mouse_motion)
         self.bind("<ButtonRelease-1>", self.mouse_up)
+        self.bind("<Motion>", self.mouse_move)
         self.bind("<Return>", self.activate)
         self.bind("<space>", self.activate)
 
@@ -121,27 +134,45 @@ class FileCard(tk.Canvas):
 
     def set_hover(self, state):
         self.hover = state
+        if not state:
+            self.extra_hover = False
         self.draw()
 
+    @staticmethod
+    def inside(area, event):
+        return area is not None and area[0] <= event.x <= area[2] and area[1] <= event.y <= area[3]
+
+    def mouse_move(self, event):
+        over = self.inside(self.extra_area, event)
+        if over != self.extra_hover:
+            self.extra_hover = over
+            self.draw()
+
     def mouse_down(self, event):
-        if self.enabled:
+        self.press_extra = self.inside(self.extra_area, event)
+        if self.enabled or self.press_extra:
             self.focus_set()
             self.press = (event.x_root, event.y_root)
 
     def mouse_motion(self, event):
-        if self.press is None or self.drag is None:
+        drag = self.extra[3] if self.press_extra else self.drag
+        if self.press is None or drag is None:
             return
         x, y = self.press
         if max(abs(event.x_root - x), abs(event.y_root - y)) < 7:
             return
         self.press = None
-        path = self.get_path()
+        path = self.extra[1]() if self.press_extra else self.get_path()
         if path is not None:
-            self.drag(path)
+            drag(path)
 
     def mouse_up(self, event):
         pressed = self.press is not None
         self.press = None
+        if pressed and self.press_extra:
+            if self.inside(self.extra_area, event):
+                self.extra[2]()
+            return
         if pressed and self.save_area is not None:
             left, top, right, bottom = self.save_area
             if left <= event.x <= right and top <= event.y <= bottom:
@@ -205,6 +236,24 @@ class FileCard(tk.Canvas):
         hint_y = detail_y + (detail_line + self.fonts["hint"].metrics("linespace")) // 2 + 6
         self.create_text(left, hint_y, anchor="w", text=self.hint, font=self.fonts["hint"],
                          fill=MUTED, tags=("hint",))
+        self.draw_extra(width, height)
+
+    def draw_extra(self, width, height):
+        self.extra_area = None
+        if self.extra is None or self.extra[1]() is None:
+            self.extra_hover = False
+            return
+        label = self.extra[0]
+        label_font = self.fonts["label"]
+        button_width = label_font.measure(label) + 26
+        button_height = label_font.metrics("linespace") + 10
+        right, bottom = width - 17, height - 15
+        area = (right - button_width, bottom - button_height, right, bottom)
+        rounded(self, *area, 10, fill=EXTRA_HOVER if self.extra_hover else EXTRA_FILL,
+                outline=EXTRA_TEXT if self.extra_hover else EXTRA_OUTLINE, tags=("extra",))
+        self.create_text(right - button_width / 2, bottom - button_height / 2, text=label,
+                         font=label_font, fill=EXTRA_TEXT, tags=("extra",))
+        self.extra_area = area
 
     def draw_result(self, width, height, ready):
         y = height // 2
@@ -267,6 +316,7 @@ class ConverterWindow:
         self.root = root
         self.project = None
         self.markdown = None
+        self.text_markdown = None    # 텍스트.md: the words only, without layout
         self.output = None
         self.converted_pdf = None
         self.source_name = None
@@ -277,7 +327,7 @@ class ConverterWindow:
         self.history_window = None
         self.fonts = screen_fonts(root)
 
-        root.title("TR · 한글 문서 편집")
+        root.title("TR · 문서 편집")
         root.configure(background=BACKGROUND)
         root.minsize(MIN_WIDTH, 440)
         root.geometry(f"{DEFAULT_WIDTH}x{DEFAULT_HEIGHT}")
@@ -300,7 +350,10 @@ class ConverterWindow:
         self.md_card = FileCard(cards, "AI 업로드용 md 파일", "markdown",
                                 lambda: self.open_file(self.markdown),
                                 lambda: self.markdown if self.job != "export" else None,
-                                self.send_markdown, fonts=self.fonts)
+                                self.send_markdown, fonts=self.fonts,
+                                extra=("텍스트 파일",
+                                       lambda: self.text_markdown if self.job != "export" else None,
+                                       lambda: self.open_file(self.text_markdown), self.send_markdown))
         self.json_card = FileCard(cards, "AI가 편집한 JSON·ZIP 파일은 이곳에 업로드하세요", "json",
                                  self.choose_json, lambda: None, None, fonts=self.fonts)
         self.source_card.grid(row=0, column=0, sticky="ew", padx=(0, 3))
@@ -339,7 +392,7 @@ class ConverterWindow:
         self.mark_surface = clay_photo(mark, mark_width, 42, "#E5D5F3", outline=CARD_OUTLINE, radius=11)
         mark.create_image(0, 0, image=self.mark_surface, anchor="nw")
         mark.create_text(mark_width // 2, 21, text="TR", font=self.fonts["mark"], fill=ACCENT_DARK)
-        tk.Label(bar, text="한글 문서 편집", bg=BACKGROUND, fg=TEXT,
+        tk.Label(bar, text="문서 편집", bg=BACKGROUND, fg=TEXT,
                  font=self.fonts["heading"], anchor="w").grid(row=0, column=1, sticky="ew")
         for column, (label, action) in enumerate(
             (("JSON 붙여넣기", self.paste_json), ("작업 내역", self.open_history),
@@ -563,7 +616,8 @@ class ConverterWindow:
                 self.set_status("PDF를 한글 파일로 바꿨습니다. 아래 카드에서 열거나 저장하세요. "
                                 "AI로 고치려면 AI용.md를 첨부하세요.", "ok")
             else:
-                self.set_status("AI 업로드용 md 파일이 준비되었습니다.", "ok")
+                self.set_status("AI 업로드용 md 파일이 준비되었습니다. 글자만 필요하면 카드 안의 "
+                                "'텍스트 파일' 버튼을 끌거나 클릭하세요.", "ok")
             self.add_log(f"{detail}  {project}", "ok")
         else:
             project, output, report, report_path = result
@@ -592,6 +646,7 @@ class ConverterWindow:
         self.markdown = project / AI_DOCUMENT
         if not self.markdown.is_file():
             self.markdown = None
+        self.text_markdown = text_document(project)
         meta = project_metadata(project) or {}
         source_name = meta.get("pdf_name") or meta.get("source_name")
         self.source_name = source_name if isinstance(source_name, str) and source_name else project.name

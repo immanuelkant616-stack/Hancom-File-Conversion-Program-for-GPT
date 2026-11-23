@@ -19,6 +19,7 @@ from pathlib import Path
 
 
 AI_DOCUMENT = "AI용.md"
+TEXT_DOCUMENT = "텍스트.md"   # the words alone, without IDs or layout
 PREVIEW = "원본보기.pdf"
 LOCAL = ".tr"
 FORMATS = {".hwp", ".hwpx"}
@@ -679,6 +680,8 @@ def export_project(source, project, *, pdf_origin=None):
             shutil.copyfile(snapshot, staged / converted_name)
         write_json(local / "project.json", metadata)
         write_ai_document(staged / AI_DOCUMENT, document, project_id)
+        from tr_text import write_text_document
+        write_text_document(staged / TEXT_DOCUMENT, document.root)
         if project.is_dir() and not any(project.iterdir()):
             project.rmdir()
         staged.rename(project)

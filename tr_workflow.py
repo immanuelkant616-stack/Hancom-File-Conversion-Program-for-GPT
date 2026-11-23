@@ -13,7 +13,7 @@ from datetime import datetime
 from itertools import count
 from pathlib import Path
 
-from tr_core import (AI_DOCUMENT, FORMATS, LOCAL, apply_project, export_project, normalize_request,
+from tr_core import (AI_DOCUMENT, FORMATS, LOCAL, TEXT_DOCUMENT, apply_project, export_project, normalize_request,
                      parse_edit_text, read_edit_request, read_json, write_json)
 
 
@@ -190,6 +190,23 @@ def pdf_conversion(project):
         return None
     path = Path(project) / windows_filename(Path(name).stem, PDF_SUFFIX + ".hwp")
     return path if path.is_file() else None
+
+
+def text_document(project):
+    """The project's text-only Markdown; projects made before it existed get one from source.xml."""
+    path = Path(project) / TEXT_DOCUMENT
+    if path.is_file():
+        return path
+    source = Path(project) / LOCAL / "source.xml"
+    if not source.is_file():
+        return None
+    from tr_text import write_text_from_xml
+
+    try:
+        write_text_from_xml(path, source)
+    except (OSError, ValueError, SyntaxError):   # ParseError is a SyntaxError
+        return None
+    return path
 
 
 def record_activity(project, kind, filename):

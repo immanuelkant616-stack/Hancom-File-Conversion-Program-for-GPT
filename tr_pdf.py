@@ -19,6 +19,7 @@ from pathlib import Path
 
 import tr_objects
 from tr_core import Document, check_file_format, hancom, publish_file, set_char
+from tr_scan import SCAN_FONT, read_scanned_pages
 
 PT = 100                 # HWPUNIT per point
 MARGIN_UNIT = 200        # PARAMARGIN values are stored at twice the HWPUNIT scale
@@ -260,9 +261,10 @@ def _inside(x, y, box, pad=1.5):
     return box.x0 - pad <= x <= box.x1 + pad and box.y0 - pad <= y <= box.y1 + pad
 
 
-def analyse_page(pymupdf, page, number, dpi=220):
+def analyse_page(pymupdf, page, number, dpi=220, scan=None):
     width, height = page.rect.width, page.rect.height
-    horizontal, vertical = _segments(page)
+    # A scanned page brings its lines, text and figures from OCR and the page image (tr_scan).
+    horizontal, vertical = (scan.horizontal, scan.vertical) if scan is not None else _segments(page)
     rules = [v for v in _merge_vertical(vertical) if v[2] - v[1] > height * 0.45
              and width * 0.3 < v[0] < width * 0.7]
     # A tall passage box has long sides too; the column rule is the longest, most central line.
@@ -288,15 +290,15 @@ def analyse_page(pymupdf, page, number, dpi=220):
     del edges
 
     flags = pymupdf.TEXTFLAGS_RAWDICT | pymupdf.TEXT_PRESERVE_IMAGES
-    raw = page.get_text("rawdict", flags=flags)
-    pictures = []
+    raw = page.get_text("rawdict", flags=flags) if scan is None else {"blocks": []}
+    pictures = [Picture(*region) for region in scan.figures] if scan is not None else []
     for block in raw["blocks"]:
         if block["type"] == 1:
             x0, y0, x1, y1 = block["bbox"]
             if x1 - x0 > 8 and y1 - y0 > 8:
                 pictures.append(Picture(x0, y0, x1, y1))
 
-    rows = []
+    rows = list(scan.rows) if scan is not None else []
     for block in raw["blocks"]:
         if block["type"] != 0:
             continue
@@ -380,10 +382,13 @@ def analyse_page(pymupdf, page, number, dpi=220):
     # The running head (above the top rule) and the footer (page number, copyright line under
     # the column rule) are page furniture; they become the page's 머리말/꼬리말.
     marks = [(row.y0, row.y1) for row in rows] + [(pic.y0, pic.y1) for pic in pictures]
-    for drawing in page.get_drawings():
-        rect = drawing["rect"]
-        marks.append((rect.y0, rect.y1))
-    above = [y0 for y0, y1 in marks if y1 <= header_line + 1.5]
+    if scan is None:
+        for drawing in page.get_drawings():
+            rect = drawing["rect"]
+            marks.append((rect.y0, rect.y1))
+    else:
+        marks += [(y, y) for _, _, y in horizontal] + [(y0, y1) for _, y0, y1 in vertical]
+    above =[y0 for y0, y1 in marks if y1 <= header_line + 1.5]
     below = [(y0, y1) for y0, y1 in marks if y0 >= body_bottom + 1]
     head_top = min(above) if above else None
     foot_top = min(y0 for y0, _ in below) if below else None
@@ -1025,17 +1030,26 @@ def convert_pdf(source, output, *, template=None, pages=None, progress=None):
     numbers = list(range(document.page_count)) if pages is None else [n for n in pages if 0 <= n < document.page_count]
     if not numbers:
         raise ValueError("변환할 PDF 쪽이 없습니다. 쪽 범위를 확인하세요.")
+    # Scanned pages have no text layer: read them with Windows OCR first.
+    scans = read_scanned_pages(pymupdf, document, numbers, Char, Row, progress)
+
+    def source_page(number):
+        """The page to read and draw from: a slanted scan is replaced by its straightened copy."""
+        scan = scans.get(number)
+        return scan.page if scan is not None and scan.page is not None else document[number]
+
     analysed = []
     characters = 0
     for position, number in enumerate(numbers):
         if progress:
             progress(f"PDF {number + 1}/{document.page_count}쪽 분석 중")
-        page = analyse_page(pymupdf, document[number], position)
+        page = analyse_page(pymupdf, source_page(number), position, scan=scans.get(number))
         analysed.append(page)
         characters += sum(len(row.chars) for items in page.columns for item in items
                           for row in ([item] if isinstance(item, Row) else getattr(item, "rows", [])))
     if not characters:
-        raise ValueError("PDF에서 선택할 수 있는 글자를 찾지 못했습니다. 스캔한 PDF는 OCR 처리가 필요합니다.")
+        raise ValueError("PDF에서 글자를 찾지 못했습니다. 글자가 없는 그림만 있는 PDF이거나, "
+                         "스캔 상태가 나빠 OCR로도 글자를 읽지 못했습니다.")
     VOCABULARY.clear()
     VOCABULARY.update(build_vocabulary(analysed))
     measure_spacing(analysed)
@@ -1048,7 +1062,7 @@ def convert_pdf(source, output, *, template=None, pages=None, progress=None):
         key = (position, round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2))
         if key not in rendered:
             clip = pymupdf.Rect(x0, y0, x1, y1)
-            rendered[key] = document[numbers[position]].get_pixmap(clip=clip, dpi=220).tobytes("png")
+            rendered[key] = source_page(numbers[position]).get_pixmap(clip=clip, dpi=220).tobytes("png")
         return Picture(x0, y0, x1, y1, rendered[key])
 
     default_style = ("함초롬바탕", 10.0, False, False, False, 0, 0)
@@ -1189,6 +1203,9 @@ def convert_pdf(source, output, *, template=None, pages=None, progress=None):
     note = " 머리말·꼬리말(쪽 번호)은 쪽마다 원본 모양 그대로 그림으로 넣었습니다." if series else ""
     if overflow:
         note += f" {len(overflow)}쪽은 원본보다 길어져 다음 쪽으로 넘쳤습니다."
+    if scans:
+        note += (f" 스캔한 {len(scans)}쪽은 Windows OCR로 글자를 읽었습니다. 글꼴은 {SCAN_FONT}으로 넣었고, "
+                 "잘못 읽은 글자가 있을 수 있으니 확인하세요.")
     return f"PDF {len(analysed)}쪽을 한글 문서로 옮겼습니다.{note}"
 
 
