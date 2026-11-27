@@ -32,6 +32,13 @@ MARGIN_DEFAULTS = {
     "Gutter": "0",
 }
 HWPUNITS_PER_MM = 7200 / 25.4
+# PARAMARGIN lengths (Left, Right, Indent, Prev, Next) are stored at twice the HWPUNIT scale.
+PARAMARGIN_PER_PT = 200
+BORDER_WIDTHS = ("0.1mm", "0.12mm", "0.15mm", "0.2mm", "0.25mm", "0.3mm", "0.4mm", "0.5mm",
+                 "0.6mm", "0.7mm", "1.0mm", "1.5mm", "2.0mm", "3.0mm", "4.0mm", "5.0mm")
+PARAGRAPH_SPACING = {"line_spacing_percent", "space_before_pt", "space_after_pt",
+                     "indent_pt", "left_margin_pt", "right_margin_pt"}
+PARAGRAPH_FRAME = {"background", "bar_color", "box_color", "padding_pt"}
 
 
 def bounded_integer(value, name, lower, upper):
@@ -269,6 +276,69 @@ def format_paragraph(doc, operation):
         doc.format_character_runs(paragraph, operation)
 
 
+def _color_value(value, name):
+    if not isinstance(value, str) or len(value) != 7 or value[0] != "#":
+        raise ValueError(f"{name}에 #RRGGBB 색상 값을 입력하세요.")
+    try:
+        return str(int.from_bytes(bytes.fromhex(value[1:]), "little"))
+    except ValueError as error:
+        raise ValueError(f"{name}에 #RRGGBB 색상 값을 입력하세요.") from error
+
+
+def _signed_points(value, name, lower, upper):
+    if type(value) not in (int, float) or not lower <= value <= upper:
+        raise ValueError(f"{name} 값은 {lower}~{upper} pt 범위의 숫자여야 합니다.")
+    return round(value * PARAMARGIN_PER_PT)
+
+
+def paragraph_frame(doc, shape, operation):
+    """Give a paragraph shape a border fill: background, a left bar and/or a thin box."""
+    frame = shape.find("PARABORDER")
+    if frame is None:
+        frame = ET.SubElement(shape, "PARABORDER", BorderFill="1", Connect="false", IgnoreMargin="false")
+    if {"background", "bar_color", "box_color"}.intersection(operation):
+        border = ET.Element("BORDERFILL", BackSlash="0", BreakCellSeparateLine="0", CenterLine="0",
+                            CounterBackSlash="0", CounterSlash="0", CrookedSlash="0", Shadow="false",
+                            Slash="0", ThreeD="false")
+        box = _color_value(operation["box_color"], "box_color") if "box_color" in operation else None
+        bar = _color_value(operation["bar_color"], "bar_color") if "bar_color" in operation else None
+        for side in ("LEFTBORDER", "RIGHTBORDER", "TOPBORDER", "BOTTOMBORDER"):
+            if side == "LEFTBORDER" and bar is not None:
+                ET.SubElement(border, side, Type="Solid", Width="1.0mm", Color=bar)
+            elif box is not None:
+                ET.SubElement(border, side, Type="Solid", Width="0.12mm", Color=box)
+            else:
+                ET.SubElement(border, side, Type="None", Width="0.1mm", Color="0")
+        ET.SubElement(border, "DIAGONAL", Type="None", Width="0.1mm", Color="0")
+        if "background" in operation:
+            brush = ET.SubElement(border, "FILLBRUSH")
+            ET.SubElement(brush, "WINDOWBRUSH", Alpha="0",
+                          FaceColor=_color_value(operation["background"], "background"), HatchColor="0")
+        borders = child_or_error(doc.root, "HEAD/MAPPINGTABLE/BORDERFILLLIST")
+        existing = borders.findall("BORDERFILL")
+        identifier = None
+        for item in existing:
+            candidate = deepcopy(item)
+            candidate.attrib.pop("Id", None)
+            if ET.tostring(candidate) == ET.tostring(border):
+                identifier = item.get("Id")
+                break
+        if identifier is None:
+            identifier = str(max((int(item.get("Id", "0")) for item in existing), default=0) + 1)
+            border.set("Id", identifier)
+            borders.append(border)
+            borders.set("Count", str(len(existing) + 1))
+        frame.set("BorderFill", identifier)
+        frame.set("Connect", "false")
+    if "padding_pt" in operation:
+        value = operation["padding_pt"]
+        if type(value) not in (int, float) or not 0 <= value <= 100:
+            raise ValueError("padding_pt 값은 0~100 pt 범위의 숫자여야 합니다.")
+        # Only above and below: sideways offsets would push the frame past the column edge.
+        for side in ("Top", "Bottom"):
+            frame.set(f"Offset{side}", str(round(value * 100)))
+
+
 def set_paragraph_format(doc, paragraph, operation):
     breaks = {}
     for field, attribute in (("page_break", "PageBreak"), ("column_break", "ColumnBreak")):
@@ -280,8 +350,7 @@ def set_paragraph_format(doc, paragraph, operation):
     if all(breaks.get(name, paragraph.get(name)) == "true" for name in ("PageBreak", "ColumnBreak")):
         raise ValueError("한 문단에는 쪽 나눔과 단 나눔을 동시에 지정할 수 없습니다.")
     paragraph.attrib.update(breaks)
-    paragraph_spacing = {"line_spacing_percent", "space_before_pt", "space_after_pt"}
-    if "align" not in operation and not paragraph_spacing.intersection(operation):
+    if "align" not in operation and not (PARAGRAPH_SPACING | PARAGRAPH_FRAME).intersection(operation):
         return
 
     shapes = child_or_error(doc.root, "HEAD/MAPPINGTABLE/PARASHAPELIST")
@@ -292,7 +361,7 @@ def set_paragraph_format(doc, paragraph, operation):
     updated = deepcopy(shape)
     if "align" in operation:
         updated.set("Align", choice(operation["align"], "align", ALIGNMENTS))
-    if paragraph_spacing.intersection(operation):
+    if PARAGRAPH_SPACING.intersection(operation):
         margin = updated.find("PARAMARGIN")
         if margin is None:
             margin = ET.Element("PARAMARGIN")
@@ -301,12 +370,13 @@ def set_paragraph_format(doc, paragraph, operation):
             value = bounded_integer(operation["line_spacing_percent"], "line_spacing_percent", 0, 500)
             margin.set("LineSpacingType", "Percent")
             margin.set("LineSpacing", str(value))
-        for name, attribute in (("space_before_pt", "Prev"), ("space_after_pt", "Next")):
+        for name, attribute, lower in (("space_before_pt", "Prev", 0), ("space_after_pt", "Next", 0),
+                                       ("left_margin_pt", "Left", 0), ("right_margin_pt", "Right", 0),
+                                       ("indent_pt", "Indent", -1000)):
             if name in operation:
-                value = operation[name]
-                if type(value) not in (int, float) or not 0 <= value <= 1000:
-                    raise ValueError(f"{name} 값은 0~1000 pt 범위의 숫자여야 합니다.")
-                margin.set(attribute, str(round(value * 100)))
+                margin.set(attribute, str(_signed_points(operation[name], name, lower, 1000)))
+    if PARAGRAPH_FRAME.intersection(operation):
+        paragraph_frame(doc, updated, operation)
     for identifier, existing in native_shapes.items():
         updated.set("Id", identifier)
         if ET.tostring(updated) == ET.tostring(existing):

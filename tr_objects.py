@@ -9,11 +9,17 @@ from xml.etree import ElementTree as ET
 import tr_layout
 
 
+CELL_CHARACTER_FIELDS = {"bold", "italic", "size_pt", "color", "font"}
 OBJECT_FIELDS = {
     "set_table_cell": ({"target", "row", "col", "text"}, set()),
-    "format_table_cell": ({"target", "row", "col"}, {"background", "align", "vertical_align"}),
+    "format_table_cell": ({"target", "row", "col"}, {"background", "align", "vertical_align"}
+                          | CELL_CHARACTER_FIELDS),
     "insert_table": ({"target", "cells"}, {"width_mm", "col_widths", "header_row", "header_background",
-                                           "position", "id"}),
+                                           "header_color", "position", "id", "border", "border_color",
+                                           "font", "size_pt", "color", "bold", "col_align", "stripe_background",
+                                           "padding_mm", "line_spacing_percent", "markup"}),
+    "insert_line_numbers": ({"target", "lines"}, {"start", "every", "size_pt", "color", "font", "gap_mm",
+                                                  "width_mm", "pitch_pt", "shift_pt", "side", "id"}),
     "delete_object": ({"target"}, set()),
     "replace_image": ({"target", "asset"}, set()),
     "insert_image": ({"target", "asset"}, {"width_mm", "height_mm", "position", "id"}),
@@ -27,6 +33,10 @@ _JPEG_FRAME_MARKERS = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
                        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 _ZERO_MARGIN = dict(Left="0", Right="0", Top="0", Bottom="0")
 _VERTICAL_ALIGNMENTS = {"top": "Top", "center": "Center", "bottom": "Bottom"}
+_CELL_KEYS = {"text", "bold", "italic", "color", "size_pt", "background", "align"}
+_BORDER_STYLES = {"all", "none", "horizontal"}
+# Margin line numbers: small grey digits beside each laid-out line of a passage paragraph.
+_LINE_NUMBER_DEFAULTS = {"size_pt": 7, "color": "#8C8C8C", "gap_mm": 1.5, "width_mm": 6.0}
 
 
 def apply_object(doc, operation):
@@ -68,6 +78,7 @@ def _edit_cell(doc, operation):
 def _format_cell(doc, operation):
     if not OBJECT_FIELDS["format_table_cell"][1].intersection(operation):
         raise ValueError("바꿀 셀 서식을 하나 이상 지정하세요.")
+    characters = {key: operation[key] for key in CELL_CHARACTER_FIELDS if key in operation}
     cell = _find_cell(doc, operation)
     contents = cell.find("PARALIST")
     if contents is None:
@@ -85,6 +96,10 @@ def _format_cell(doc, operation):
         contents.set("VertAlign", vertical)
     if background is not None:
         cell.set("BorderFill", _filled_border(doc.root, cell.get("BorderFill"), background))
+    if characters:
+        for paragraph in contents.findall("P"):
+            if doc.plain_text(paragraph):
+                doc.format_character_runs(paragraph, characters)
 
 
 def _cell_text(value):
@@ -226,10 +241,15 @@ def _append_border(borders, border):
     return identifier
 
 
-def _table_border(root):
+def _table_border(root, style="all", color="0"):
     border = ET.Element("BORDERFILL", BackSlash="0", Slash="0", Shadow="false", ThreeD="false")
+    drawn = {"all": {"LEFTBORDER", "RIGHTBORDER", "TOPBORDER", "BOTTOMBORDER"},
+             "horizontal": {"TOPBORDER", "BOTTOMBORDER"}, "none": set()}[style]
     for kind in ("LEFTBORDER", "RIGHTBORDER", "TOPBORDER", "BOTTOMBORDER"):
-        ET.SubElement(border, kind, Type="Solid", Width="0.12mm", Color="0")
+        if kind in drawn:
+            ET.SubElement(border, kind, Type="Solid", Width="0.12mm", Color=color)
+        else:
+            ET.SubElement(border, kind, Type="None", Width="0.1mm", Color="0")
     ET.SubElement(border, "DIAGONAL", Type="None", Width="0.12mm", Color="0")
     return _append_border(_border_list(root), border)
 
@@ -254,7 +274,31 @@ def _filled_border(root, identifier, color):
     return _append_border(borders, clone)
 
 
+def _cell_spec(value):
+    """A cell is a string or an object {text, bold, italic, color, size_pt, background, align}."""
+    if isinstance(value, str):
+        return {"text": value}
+    if not isinstance(value, dict) or "text" not in value:
+        raise ValueError("셀은 문자열 또는 text를 담은 객체여야 합니다.")
+    unknown = set(value) - _CELL_KEYS
+    if unknown:
+        raise ValueError(f"셀 객체에 알 수 없는 항목이 있습니다. {sorted(unknown)}. 사용 가능 {sorted(_CELL_KEYS)}")
+    return value
+
+
+def _padding(value):
+    if type(value) in (int, float):
+        value = [value, value]
+    if (not isinstance(value, list) or len(value) != 2
+            or any(type(item) not in (int, float) or not 0 <= item <= 20 for item in value)):
+        raise ValueError("padding_mm는 0~20 사이 숫자 또는 [좌우, 위아래] 배열이어야 합니다.")
+    side, edge = (round(item * 7200 / 25.4) for item in value)
+    return dict(Left=str(side), Right=str(side), Top=str(edge), Bottom=str(edge))
+
+
 def _insert_table(doc, operation):
+    from tr_core import parse_markup
+
     anchor = doc.get(operation["target"], "paragraph")
     cells = operation["cells"]
     if not isinstance(cells, list) or not cells:
@@ -264,21 +308,38 @@ def _insert_table(doc, operation):
     rows, cols = len(cells), len(cells[0])
     if rows * cols > 16384:
         raise ValueError("한글 표의 셀 수는 최대 16,384개입니다.")
+    specs = []
     for row in cells:
         if not isinstance(row, list) or len(row) != cols:
             raise ValueError("새 표의 모든 행은 열 수가 같아야 합니다.")
-        for value in row:
-            _cell_lines(value)
+        specs.append([_cell_spec(value) for value in row])
+        for spec in specs[-1]:
+            _cell_lines(spec["text"])
     position = operation.get("position", "end")
+    markup = operation.get("markup", False)
+    if type(markup) is not bool:
+        raise ValueError("markup에는 true 또는 false를 입력하세요.")
 
-    header_row = operation.get("header_row", "header_background" in operation)
+    header_row = operation.get("header_row", "header_background" in operation or "header_color" in operation)
     if type(header_row) is not bool:
         raise ValueError("header_row에 true 또는 false를 입력하세요.")
-    header_color = None
-    if "header_background" in operation:
+    header_fill = None
+    if "header_background" in operation or "header_color" in operation:
         if not header_row:
-            raise ValueError("header_background를 지정하려면 첫 행을 제목 행으로 설정하세요.")
-        header_color = _color_ref(operation["header_background"], "header_background")
+            raise ValueError("header_background·header_color를 지정하려면 첫 행을 제목 행으로 설정하세요.")
+    if "header_background" in operation:
+        header_fill = _color_ref(operation["header_background"], "header_background")
+    stripe = (_color_ref(operation["stripe_background"], "stripe_background")
+              if "stripe_background" in operation else None)
+    style = operation.get("border", "all")
+    if style not in _BORDER_STYLES:
+        raise ValueError(f"border는 {', '.join(sorted(_BORDER_STYLES))} 중 하나여야 합니다.")
+    line_color = _color_ref(operation["border_color"], "border_color") if "border_color" in operation else "0"
+    alignments = operation.get("col_align")
+    if alignments is not None and (not isinstance(alignments, list) or len(alignments) != cols):
+        raise ValueError("col_align은 열 수와 같은 길이의 정렬 배열이어야 합니다.")
+    for alignment in alignments or []:
+        tr_layout.choice(alignment, "col_align", tr_layout.ALIGNMENTS)
     if "width_mm" in operation:
         width = _dimension_units(operation["width_mm"], "width_mm")
     else:
@@ -289,37 +350,181 @@ def _insert_table(doc, operation):
         raise ValueError("열당 폭이 너무 좁습니다. 열 수를 줄이거나 표 폭을 늘리세요.")
     column_widths = _column_widths(operation, cols, width)
     row_height = 1800
-    border = _table_border(doc.root)
-    header_border = border if header_color is None else _filled_border(doc.root, border, header_color)
+    border = _table_border(doc.root, style, line_color)
+    fills = {}
+
+    def filled(color):
+        if color is None:
+            return border
+        if color not in fills:
+            fills[color] = _filled_border(doc.root, border, color)
+        return fills[color]
+
     table = ET.Element("TABLE", BorderFill=border, CellSpacing="0", ColCount=str(cols),
                        PageBreak="Cell", RepeatHeader=str(header_row).lower(), RowCount=str(rows))
     _new_shape(doc, table, "Table", width, rows * row_height)
     # Hangul's own default cell padding: 1.8mm left/right, 0.5mm top/bottom.
-    ET.SubElement(table, "INSIDEMARGIN", Left="510", Right="510", Top="141", Bottom="141")
-    char_shape = doc.char_shape(anchor)
-    for row_number, values in enumerate(cells):
+    inside = (_padding(operation["padding_mm"]) if "padding_mm" in operation
+              else dict(Left="510", Right="510", Top="141", Bottom="141"))
+    ET.SubElement(table, "INSIDEMARGIN", inside)
+    base_shape = doc.char_shape(anchor)
+    table_characters = {key: operation[key] for key in ("font", "size_pt", "color", "bold") if key in operation}
+    if table_characters:
+        base_shape = doc.character_variant(base_shape, doc.character_changes(table_characters))
+    header_characters = {"bold": True}
+    if "header_color" in operation:
+        header_characters["color"] = operation["header_color"]
+    header_shape = doc.character_variant(base_shape, doc.character_changes(header_characters))
+    paragraph_fields = {}
+    if "line_spacing_percent" in operation:
+        paragraph_fields["line_spacing_percent"] = operation["line_spacing_percent"]
+    for row_number, values in enumerate(specs):
         header = header_row and row_number == 0
+        body_index = row_number - (1 if header_row else 0)
         row = ET.SubElement(table, "ROW")
-        for col_number, value in enumerate(values):
-            cell_width = column_widths[col_number]
-            cell = ET.SubElement(row, "CELL", BorderFill=header_border if header else border,
+        for col_number, spec in enumerate(values):
+            if "background" in spec:
+                fill = filled(_color_ref(spec["background"], "background"))
+            elif header:
+                fill = filled(header_fill)
+            elif stripe is not None and body_index % 2 == 1:
+                fill = filled(stripe)
+            else:
+                fill = border
+            cell = ET.SubElement(row, "CELL", BorderFill=fill,
                                  ColAddr=str(col_number), ColSpan="1",
                                  Dirty="false", Editable="false", HasMargin="false", Header=str(header).lower(),
                                  Height=str(row_height), Protect="false", RowAddr=str(row_number),
-                                 RowSpan="1", Width=str(cell_width))
+                                 RowSpan="1", Width=str(column_widths[col_number]))
             ET.SubElement(cell, "CELLMARGIN", Left="141", Right="141", Top="141", Bottom="141")
             plist = ET.SubElement(cell, "PARALIST", LineWrap="Break", LinkListID="0", LinkListIDNext="0",
                                   TextDirection="0", VertAlign="Center")
-            for line in _cell_lines(value):
+            alignment = spec.get("align") or ("center" if header else
+                                              (alignments[col_number] if alignments else None))
+            characters = {key: spec[key] for key in ("bold", "italic", "color", "size_pt") if key in spec}
+            for line in _cell_lines(spec["text"]):
+                text, spans = parse_markup(line) if markup else (line, [])
                 paragraph = ET.SubElement(plist, "P", ParaShape="0", Style="0")
-                ET.SubElement(paragraph, "TEXT", CharShape=char_shape)
-                if line:
-                    doc.replace_paragraph_text(paragraph, line)
-                if header:
-                    tr_layout.set_paragraph_format(doc, paragraph, {"align": "center"})
-                    doc.format_character_runs(paragraph, {"bold": True})
+                ET.SubElement(paragraph, "TEXT", CharShape=header_shape if header else base_shape)
+                if text:
+                    doc.replace_paragraph_text(paragraph, text)
+                fields = dict(paragraph_fields)
+                if alignment is not None:
+                    fields["align"] = alignment
+                if fields:
+                    tr_layout.set_paragraph_format(doc, paragraph, fields)
+                if text and characters:
+                    doc.format_character_runs(paragraph, characters)
+                if text:
+                    doc.bold_spans(paragraph, spans)
     doc.register(operation.get("id"), table, "table")
     doc.add_control(anchor, table, position)
+
+
+def _positive(value, name, lower, upper, integer=False):
+    kinds = (int,) if integer else (int, float)
+    if type(value) not in kinds or not lower <= value <= upper:
+        kind = "정수" if integer else "숫자"
+        raise ValueError(f"{name} 값은 {lower}~{upper} 범위의 {kind}여야 합니다.")
+    return value
+
+
+def line_pitch(doc, paragraph, *, pitch=None):
+    """Glyph height and line pitch in HWP units. Infer pitch from percentage spacing when omitted."""
+    characters = doc.root.find("HEAD/MAPPINGTABLE/CHARSHAPELIST")
+    char = None if characters is None else next(
+        (item for item in characters.findall("CHARSHAPE") if item.get("Id") == doc.dominant_shape(paragraph)), None)
+    height = int(char.get("Height", "1000")) if char is not None else 1000
+    if pitch is not None:
+        return height, pitch
+    shapes = doc.root.find("HEAD/MAPPINGTABLE/PARASHAPELIST")
+    shape = None if shapes is None else next(
+        (item for item in shapes.findall("PARASHAPE") if item.get("Id") == paragraph.get("ParaShape", "0")), None)
+    margin = None if shape is None else shape.find("PARAMARGIN")
+    if margin is not None and margin.get("LineSpacingType", "Percent") != "Percent":
+        raise ValueError("이 문단은 줄 간격이 비율(%)이 아니므로 pitch_pt(줄 사이 거리)를 지정하세요.")
+    spacing = int(margin.get("LineSpacing", "160")) if margin is not None else 160
+    return height, round(height * spacing / 100)
+
+
+def _insert_line_numbers(doc, operation):
+    """Float a borderless one-column table of line numbers beside a passage paragraph.
+
+    Hangul 2018 has no native line numbering, so the digits are drawn as a table that stays
+    in front of the text, anchored to the paragraph, one row per laid-out line.
+    """
+    anchor = doc.get(operation["target"], "paragraph")
+    if doc.parent(anchor) is None or doc.parent(anchor).tag != "SECTION":
+        raise ValueError("줄 번호는 본문(표 밖) 문단에만 넣을 수 있습니다.")
+    count = _positive(operation["lines"], "lines", 1, 500, integer=True)
+    start = operation.get("start", getattr(doc, "next_line_number", 1))
+    start = _positive(start, "start", 0, 99999, integer=True)
+    every = _positive(operation.get("every", 1), "every", 1, 100, integer=True)
+    settings = {**_LINE_NUMBER_DEFAULTS, **{key: operation[key] for key in _LINE_NUMBER_DEFAULTS
+                                            if key in operation}}
+    size = _positive(settings["size_pt"], "size_pt", 3, 30)
+    gap = round(_positive(settings["gap_mm"], "gap_mm", 0, 60) * 7200 / 25.4)
+    width = round(_positive(settings["width_mm"], "width_mm", 2, 60) * 7200 / 25.4)
+    side = operation.get("side", "left")
+    if side not in ("left", "right"):
+        raise ValueError("side는 left 또는 right여야 합니다.")
+    pitch_override = (round(_positive(operation["pitch_pt"], "pitch_pt", 1, 200) * 100)
+                      if "pitch_pt" in operation else None)
+    font_height, pitch = line_pitch(doc, anchor, pitch=pitch_override)
+    # Centre the small digits on the passage glyphs. Hangul sets each line's text at the top of
+    # its line box; measured on Hangul 2018 PDFs the glyph middles line up when the number
+    # column starts 0.32 x (passage size - number size) below the first line's top.
+    shift = round((font_height - size * 100) * 0.32)
+    if "shift_pt" in operation:
+        shift += round(_positive(operation["shift_pt"], "shift_pt", -100, 100) * 100)
+
+    blank = _table_border(doc.root, "none")
+    table = ET.Element("TABLE", BorderFill=blank, CellSpacing="0", ColCount="1", PageBreak="None",
+                       RepeatHeader="false", RowCount=str(count))
+    _new_shape(doc, table, "Table", width, count * pitch)
+    shape = table.find("SHAPEOBJECT")
+    shape.set("TextWrap", "InFrontOfText")
+    shape.set("TextFlow", "BothSides")
+    # Measured outwards from the column edge on the chosen side, so the digits sit in the margin.
+    shape.find("POSITION").attrib.update(
+        AllowOverlap="true", FlowWithText="false", HorzAlign="Left" if side == "left" else "Right",
+        HorzOffset=str(-(width + gap)), HorzRelTo="Column", TreatAsChar="false",
+        VertAlign="Top", VertOffset=str(shift), VertRelTo="Para")
+    ET.SubElement(table, "INSIDEMARGIN", _ZERO_MARGIN)
+    char_shape = doc.character_variant(doc.dominant_shape(anchor), doc.character_changes(
+        {"size_pt": size, "color": settings["color"], "bold": False, "italic": False,
+         **({"font": operation["font"]} if "font" in operation else {})}))
+    number_style = {"align": "right" if side == "left" else "left", "line_spacing_percent": 100,
+                    "left_margin_pt": 0, "right_margin_pt": 0, "indent_pt": 0,
+                    "space_before_pt": 0, "space_after_pt": 0}
+    for index in range(count):
+        number = start + index
+        row = ET.SubElement(table, "ROW")
+        cell = ET.SubElement(row, "CELL", BorderFill=blank, ColAddr="0", ColSpan="1", Dirty="false",
+                             Editable="false", HasMargin="true", Header="false", Height=str(pitch),
+                             Protect="false", RowAddr=str(index), RowSpan="1", Width=str(width))
+        ET.SubElement(cell, "CELLMARGIN", _ZERO_MARGIN)
+        plist = ET.SubElement(cell, "PARALIST", LineWrap="Break", LinkListID="0", LinkListIDNext="0",
+                              TextDirection="0", VertAlign="Top")
+        paragraph = ET.SubElement(plist, "P", ParaShape="0", Style="0")
+        ET.SubElement(paragraph, "TEXT", CharShape=char_shape)
+        if number % every == 0 or every == 1:
+            doc.replace_paragraph_text(paragraph, str(number))
+        tr_layout.set_paragraph_format(doc, paragraph, number_style)
+    doc.next_line_number = start + count
+    doc.register(operation.get("id"), table, "table")
+    # A paragraph-relative object is placed from the line holding its anchor, so anchor the
+    # numbers at the start of the paragraph (after any section or column definition).
+    runs = list(anchor)
+    index = 0
+    while index < len(runs) and runs[index].tag == "TEXT" and (
+            runs[index].find("SECDEF") is not None or runs[index].find("COLDEF") is not None):
+        index += 1
+    first = next((run for run in anchor.findall("TEXT")), None)
+    holder = ET.Element("TEXT", CharShape=first.get("CharShape", "0") if first is not None else "0")
+    holder.append(table)
+    ET.SubElement(holder, "CHAR")
+    anchor.insert(index, holder)
 
 
 def _delete_object(doc, operation):
@@ -493,6 +698,7 @@ _HANDLERS = {
     "set_table_cell": _edit_cell,
     "format_table_cell": _format_cell,
     "insert_table": _insert_table,
+    "insert_line_numbers": _insert_line_numbers,
     "delete_object": _delete_object,
     "replace_image": _replace_image,
     "insert_image": _insert_image,

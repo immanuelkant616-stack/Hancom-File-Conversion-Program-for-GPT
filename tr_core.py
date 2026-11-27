@@ -24,6 +24,8 @@ PREVIEW = "원본보기.pdf"
 LOCAL = ".tr"
 FORMATS = {".hwp", ".hwpx"}
 SPACES = {"FWSPACE": "\u3000", "NBSPACE": "\u00a0"}
+# Native highlighter boundaries take no space in the document text.
+CHAR_INLINE_TEXT = SPACES | {"MARKPENBEGIN": "", "MARKPENEND": ""}
 OBJECTS = {
     "TABLE": "table", "PICTURE": "picture", "RECTANGLE": "object",
     "ELLIPSE": "object", "LINE": "object", "POLYGON": "object",
@@ -36,8 +38,9 @@ PREFIXES = {"P": ("P", "paragraph"), "SECTION": ("S", "section"),
 CHARACTER_FIELDS = {"bold", "italic", "size_pt", "color", "font", "highlight"}
 NO_SHADE = 0xFFFFFFFF
 PARAGRAPH_FIELDS = {"align", "line_spacing_percent", "space_before_pt", "space_after_pt",
-                    "page_break", "column_break"}
-INSERT_FIELDS = PARAGRAPH_FIELDS | CHARACTER_FIELDS | {"position", "style_from"}
+                    "page_break", "column_break", "indent_pt", "left_margin_pt", "right_margin_pt",
+                    "background", "bar_color", "box_color", "padding_pt"}
+INSERT_FIELDS = PARAGRAPH_FIELDS | CHARACTER_FIELDS | {"position", "style_from", "markup"}
 TEXT_FIELDS = {
     "replace_text": ({"target", "old", "new"}, set()),
     "replace_all": ({"old", "new"}, set()),
@@ -45,6 +48,7 @@ TEXT_FIELDS = {
     "insert_paragraph": ({"target", "text"}, INSERT_FIELDS | {"id"}),
     "insert_paragraphs": ({"target", "texts"}, INSERT_FIELDS | {"ids"}),
     "delete_paragraph": ({"target"}, set()),
+    "delete_memos": ({"target"}, set()),
     "remove_directive": ({"target"}, {"replacement", "style_from"}),
 }
 # Optional free-text keys an AI may attach to any operation; TR shows them in reports.
@@ -53,6 +57,21 @@ NOTE_KEYS = {"note", "comment"}
 DIRECTIVE = re.compile(r"(?:\[\[|［［)\s*(.+?)\s*(?:\]\]|］］)")
 NEW_ID = re.compile(r"N[0-9A-Za-z_]{1,24}")
 BLANK = " \t　 "
+# Opt-in inline markup ("markup": true): **굵게** marks bold spans in new text.
+BOLD_MARKUP = re.compile(r"\*\*(.+?)\*\*")
+
+
+def parse_markup(text):
+    """Strip **bold** markers and return (plain text, [(start, end), ...] bold spans)."""
+    if not isinstance(text, str):
+        return text, []
+    plain, spans, position = "", [], 0
+    for match in BOLD_MARKUP.finditer(text):
+        plain += text[position:match.start()]
+        spans.append((len(plain), len(plain) + len(match.group(1))))
+        plain += match.group(1)
+        position = match.end()
+    return plain + text[position:], spans
 
 
 def file_hash(path):
@@ -87,7 +106,7 @@ def require_text(value, name):
 
 def char_value(char):
     return (char.text or "") + "".join(
-        SPACES.get(child.tag, "\uFFFC") + (child.tail or "") for child in char
+        CHAR_INLINE_TEXT.get(child.tag, "\uFFFC") + (child.tail or "") for child in char
     )
 
 
@@ -98,6 +117,19 @@ def set_char(char, value):
     tags = {value: tag for tag, value in SPACES.items()}
     for letter, text in zip(pieces[1::2], pieces[2::2]):
         ET.SubElement(char, tags[letter]).tail = text or None
+
+
+def remove_inline(parent, child):
+    """Remove an inline element, keeping the text that followed it."""
+    tail = child.tail or ""
+    children = list(parent)
+    index = children.index(child)
+    if tail:
+        if index:
+            children[index - 1].tail = (children[index - 1].tail or "") + tail
+        else:
+            parent.text = (parent.text or "") + tail
+    parent.remove(child)
 
 
 def text_groups(paragraph):
@@ -204,6 +236,8 @@ class Document:
                 self.ids[label] = element
                 self.categories[label] = category
                 self.labels[element] = label
+        # Where each body paragraph's printed lines start (tr_lines), when the preview was read.
+        self.line_layout = {}
         self.directives = {}
         for paragraph in self.body.iter("P"):
             for group in text_groups(paragraph):
@@ -359,7 +393,11 @@ class Document:
         if position == "before" and anchor.find("TEXT/SECDEF") is not None:
             raise ValueError("구역 첫 문단 앞에 삽입할 수 없습니다. position을 after로 지정하세요.")
         model = self.get(operation["style_from"], "paragraph") if "style_from" in operation else anchor
-        nodes = [self.new_paragraph(anchor, text, model) for text in texts]
+        markup = operation.get("markup", False)
+        if type(markup) is not bool:
+            raise ValueError("markup에는 true 또는 false를 입력하세요.")
+        parsed = [parse_markup(text) if markup else (text, []) for text in texts]
+        nodes = [self.new_paragraph(anchor, text, model) for text, _ in parsed]
         index = list(parent).index(anchor) + (position == "after")
         for offset, node in enumerate(nodes):
             parent.insert(index + offset, node)
@@ -373,6 +411,7 @@ class Document:
                 set_paragraph_format(self, node, fields)
             if CHARACTER_FIELDS.intersection(fields):
                 self.format_character_runs(node, fields)
+            self.bold_spans(node, parsed[number][1])
             self.register(label, node, "paragraph")
 
     def remove_directive(self, operation):
@@ -432,9 +471,48 @@ class Document:
         self.format_character_selection(paragraph, selection, operation)
 
     def format_character_runs(self, paragraph, operation):
+        if "highlight" in operation and operation["highlight"] is None:
+            # Clearing highlights also clears Hangul's own highlighter marks; they would
+            # otherwise keep the marked characters out of the editable text.
+            self.clear_highlighter(paragraph)
         selection = [(char, 0, len(char_value(char))) for group in text_groups(paragraph)
                      for char in group if char_value(char)]
         self.format_character_selection(paragraph, selection, operation)
+
+    @staticmethod
+    def clear_highlighter(paragraph):
+        """Remove Hangul's native highlighter (형광펜) marks from a paragraph's own text."""
+        for char in paragraph.findall("TEXT/CHAR"):
+            for mark in [child for child in char if child.tag in ("MARKPENBEGIN", "MARKPENEND")]:
+                remove_inline(char, mark)
+
+    def memo_ends(self):
+        """Map each memo start to its end. Memo ends carry no instance id, so pair them in order."""
+        ends, starts = {}, []
+        for run in self.body.iter("TEXT"):
+            for item in run:
+                if item.get("Type") != "Memo":
+                    continue
+                if item.tag == "FIELDBEGIN":
+                    starts.append(item)
+                elif item.tag == "FIELDEND":
+                    if not starts:
+                        raise ValueError("시작 표시 없는 메모 끝 표시가 있어 메모를 지우지 않았습니다.")
+                    ends[starts.pop()] = (run, item)
+        if starts:
+            raise ValueError("끝 표시가 없는 메모가 있어 메모를 지우지 않았습니다.")
+        return ends
+
+    def delete_memos(self, paragraph):
+        """Remove the memos anchored in a paragraph; the text they annotate stays."""
+        fields = [(run, item) for run in paragraph.findall("TEXT") for item in run
+                  if item.tag == "FIELDBEGIN" and item.get("Type") == "Memo"]
+        if not fields:
+            raise ValueError("이 문단에는 지울 메모가 없습니다.")
+        ends = self.memo_ends()
+        for run, item in fields:
+            remove_inline(*ends[item])
+            remove_inline(run, item)
 
     def font_references(self, value):
         name = require_text(value, "font").strip()
@@ -460,7 +538,21 @@ class Document:
             references[lang] = found.get("Id")
         return references
 
-    def format_character_selection(self, paragraph, selection, operation):
+    def bold_spans(self, paragraph, spans, fields=None):
+        """Embolden [start, end) offsets of a freshly written paragraph (see parse_markup)."""
+        for start, end in spans:
+            offset = 0
+            for group in text_groups(paragraph):
+                length = sum(len(char_value(char)) for char in group)
+                if offset <= start < offset + length:
+                    pieces = selection_pieces(group, start - offset, end - start)
+                    self.format_character_selection(paragraph, pieces, fields or {"bold": True})
+                    break
+                offset += length
+
+    @staticmethod
+    def character_changes(operation):
+        """Validate character fields once and return what a variant shape must change."""
         if not CHARACTER_FIELDS.intersection(operation):
             raise ValueError("변경할 글자 서식을 하나 이상 지정하세요.")
         variants = {}
@@ -486,41 +578,59 @@ class Document:
                 allowed = "#RRGGBB 색상 또는 null(강조 제거)" if field == "highlight" else "#RRGGBB 색상"
                 raise ValueError(f"{field}에는 {allowed}을 입력하세요.")
             attributes[attribute] = str(int.from_bytes(bytes.fromhex(color[1:]), "little"))
-        fonts = self.font_references(operation["font"]) if "font" in operation else {}
+        font = require_text(operation["font"], "font") if "font" in operation else None
+        return variants, attributes, font
+
+    def character_variant(self, original_id, changes):
+        """Id of a character shape like original_id with changes applied, reusing an identical shape."""
+        variants, attributes, font = changes
         styles = self.root.find("HEAD/MAPPINGTABLE/CHARSHAPELIST")
         if styles is None:
             raise ValueError("글자 모양 목록을 찾을 수 없습니다.")
-        lookup = {style.get("Id"): style for style in styles.findall("CHARSHAPE")}
-        next_id = max(map(int, lookup), default=-1) + 1
+        shapes = styles.findall("CHARSHAPE")
+        original = next((style for style in shapes if style.get("Id") == original_id), None)
+        if original is None:
+            raise ValueError("대상 글자의 서식을 찾을 수 없습니다.")
+        clone = deepcopy(original)
+        clone.attrib.update(attributes)
+        if font is not None:
+            font_ids = clone.find("FONTID")
+            if font_ids is None:
+                font_ids = ET.Element("FONTID")
+                clone.insert(0, font_ids)
+            font_ids.attrib.update(self.font_references(font))
+        for tag, enabled in variants.items():
+            found = clone.find(tag)
+            if enabled and found is None:
+                ET.SubElement(clone, tag)
+            elif not enabled and found is not None:
+                clone.remove(found)
+
+        def signature(style):
+            copy = deepcopy(style)
+            copy.attrib.pop("Id", None)
+            return ET.tostring(copy)
+
+        wanted = signature(clone)
+        if wanted == signature(original):
+            return original_id
+        for style in shapes:
+            if signature(style) == wanted:
+                return style.get("Id")
+        identifier = str(max((int(style.get("Id", "0")) for style in shapes), default=-1) + 1)
+        clone.set("Id", identifier)
+        styles.append(clone)
+        styles.set("Count", str(len(shapes) + 1))
+        return identifier
+
+    def format_character_selection(self, paragraph, selection, operation):
+        changes = self.character_changes(operation)
         clones = {}
         for char, start, end in selection:
             run = next(run for run in paragraph.findall("TEXT") if char in run)
             original_id = run.get("CharShape", "0")
             if original_id not in clones:
-                original = lookup.get(original_id)
-                if original is None:
-                    raise ValueError("대상 글자의 서식을 찾을 수 없습니다.")
-                clone = deepcopy(original)
-                clone.attrib.update(attributes)
-                if fonts:
-                    font_ids = clone.find("FONTID")
-                    if font_ids is None:
-                        font_ids = ET.Element("FONTID")
-                        clone.insert(0, font_ids)
-                    font_ids.attrib.update(fonts)
-                for tag, enabled in variants.items():
-                    found = clone.find(tag)
-                    if enabled and found is None:
-                        ET.SubElement(clone, tag)
-                    elif not enabled and found is not None:
-                        clone.remove(found)
-                clones[original_id] = original_id
-                if ET.tostring(original) != ET.tostring(clone):
-                    clone.set("Id", str(next_id))
-                    clones[original_id] = str(next_id)
-                    styles.append(clone)
-                    styles.set("Count", str(len(styles.findall("CHARSHAPE"))))
-                    next_id += 1
+                clones[original_id] = self.character_variant(original_id, changes)
             styled_run(paragraph, run, char, start, end, clones[original_id])
 
     def text_edit(self, operation):
@@ -545,6 +655,9 @@ class Document:
             return
         if action == "format_text":
             self.format_text(paragraph, operation)
+            return
+        if action == "delete_memos":
+            self.delete_memos(paragraph)
             return
         if action == "delete_paragraph":
             if paragraph.find("TEXT/SECDEF") is not None or paragraph.find("TEXT/COLDEF") is not None:
@@ -581,6 +694,12 @@ class Document:
                 groups = ["".join(map(char_value, group)) for group in text_groups(element)]
                 if len(groups) > 1:
                     record["editable_segments"] = groups
+                marks = len(element.findall("TEXT/CHAR/MARKPENBEGIN"))
+                if marks:
+                    record["highlighter"] = marks
+                memos = sum(item.get("Type") == "Memo" for item in element.findall("TEXT/FIELDBEGIN"))
+                if memos:
+                    record["memos"] = memos
                 record["para_shape"] = element.get("ParaShape", "0")
                 record["style"] = element.get("Style", "0")
                 offset = 0
@@ -603,6 +722,8 @@ class Document:
                         record[key] = True
                 if element in directives:
                     record["directives"] = directives[element]
+                if label in self.line_layout:
+                    record["line_starts"] = self.line_layout[label]
             elif category == "section":
                 page = element.find("P/TEXT/SECDEF/PAGEDEF")
                 if page is not None:
@@ -682,6 +803,7 @@ def export_project(source, project, *, pdf_origin=None):
             shutil.copyfile(native / "source.xml", xml)
             shutil.copyfile(native / "preview.pdf", staged / PREVIEW)
         document = Document.read(xml, project)
+        document.line_layout = preview_line_layout(document, staged / PREVIEW)
         project_id = str(uuid.uuid4())
         metadata = {
             "version": 1, "project_id": project_id, "format": source.suffix.lower(), "source_name": source.name,
@@ -702,6 +824,15 @@ def export_project(source, project, *, pdf_origin=None):
     if document.directives:
         status += f" 문서 안의 [[ ]] 지시 {len(document.directives)}개를 AI용.md에 정리했습니다."
     return status + " AI용.md를 첨부하세요."
+
+
+def preview_line_layout(document, pdf):
+    """Line starts of multi-line body paragraphs in the preview PDF; empty when it cannot be read."""
+    try:
+        from tr_lines import line_layout
+        return line_layout(document, pdf)
+    except Exception:  # Optional extra for AI용.md: a PDF reader problem must not stop the export.
+        return {}
 
 
 def operation_handlers():

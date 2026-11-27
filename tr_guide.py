@@ -53,10 +53,11 @@ TR은 언제나 **처음 내보낸 원본**에 JSON을 적용합니다. 같은 �
 - `replace_all` — `old`, `new`. 문서 전체에서 같은 문구를 모두 바꿉니다. 한 번도 없으면 실패합니다.
 - `format_text` — `target`(P), `text`(원래 문구), 선택 `occurrence`(문단 안에서 앞부터 센 일치 순서, 1부터 시작, 생략하면 정확히 한 번만 일치해야 함), `font`(글꼴 이름), `bold`, `italic`(참/거짓), `size_pt`, `color`(글자색 `#RRGGBB`), `highlight`(형광펜처럼 글자 뒤에 들어가는 배경색 `#RRGGBB`, 제거는 `null`).
 - 사진 속 형광펜을 옮겨 달라는 요청에는 `format_text`의 `highlight`를 쓰세요. 문서 데이터에서 칠해진 문구에 해당하는 정확한 `text`와 문단 ID를 찾고, 색과 범위를 각각 유지하세요. 예를 들어 초록은 `#C6EF63`, 주황은 `#FFB45C`입니다. 여러 문단에 걸친 표시는 문단별 명령으로 나누고, 한 문단에서 같은 문구가 반복되면 `occurrence`를 지정하세요. 기존 글자 모양을 유지하려면 `bold`와 `color`는 생략하세요.
-- `insert_paragraph` — `target`(P), `text`, 선택 `position`(`before`/`after`, 기본 `after`), `style_from`(모양을 본뜰 P), `id`(새 문단 이름), 문단·글자 서식(`format_paragraph`와 같은 키).
-- `insert_paragraphs` — `target`(P), `texts`(문단 문자열 배열, 적힌 순서대로 들어감), 선택 `position`, `style_from`, `ids`(texts와 같은 길이의 이름 배열), 문단·글자 서식.
+- `insert_paragraph` — `target`(P), `text`, 선택 `position`(`before`/`after`, 기본 `after`), `style_from`(모양을 본뜰 P), `id`(새 문단 이름), `markup`(참이면 `text` 안의 `**굵게**` 표시를 굵은 글자로 바꿈), 문단·글자 서식(`format_paragraph`와 같은 키).
+- `insert_paragraphs` — `target`(P), `texts`(문단 문자열 배열, 적힌 순서대로 들어감), 선택 `position`, `style_from`, `ids`(texts와 같은 길이의 이름 배열), `markup`, 문단·글자 서식.
 - `delete_paragraph` — `target`(P). 문단과 그 안의 개체를 지웁니다. 구역/단 설정 문단과 셀의 마지막 문단은 보호됩니다.
-- `format_paragraph` — `target`(P), 선택 `align`(`left`, `center`, `right`, `justify`, `distribute`, `distribute_space`), `line_spacing_percent`, `space_before_pt`, `space_after_pt`, `page_break`·`column_break`(참/거짓), 그리고 문단 전체 글자에 `font`, `bold`, `italic`, `size_pt`, `color`, `highlight`.
+- `delete_memos` — `target`(P). 그 문단에 달린 한글 메모를 모두 지웁니다. 메모가 달린 글은 그대로 남습니다.
+- `format_paragraph` — `target`(P), 선택 `align`(`left`, `center`, `right`, `justify`, `distribute`, `distribute_space`), `line_spacing_percent`, `space_before_pt`, `space_after_pt`, `left_margin_pt`·`right_margin_pt`(문단 왼쪽·오른쪽 여백), `indent_pt`(첫 줄 들여쓰기, 음수면 내어쓰기), `page_break`·`column_break`(참/거짓), 문단 꾸밈 `bar_color`(왼쪽 굵은 세로 막대 색), `box_color`(가는 테두리 색), `background`(문단 배경색), `padding_pt`(꾸밈의 위아래 여백), 그리고 문단 전체 글자에 `font`, `bold`, `italic`, `size_pt`, `color`, `highlight`. 색은 모두 `#RRGGBB`. `highlight`가 `null`이면 글자 배경색과 함께 한글 형광펜 표시도 지웁니다.
 - `remove_directive` — `target`(D), 선택 `replacement`(지시 자리에 넣을 문구), `style_from`(지시만 있던 문단에 입힐 본보기 P). 지시 문구 `[[…]]`를 지우거나 바꿉니다.
 
 조판
@@ -66,8 +67,9 @@ TR은 언제나 **처음 내보낸 원본**에 JSON을 적용합니다. 같은 �
 
 표
 - `set_table_cell` — `target`(T 또는 새 표 id), `row`, `col`, `text`. 셀이 한 문단이어야 합니다. 병합 셀은 시작 좌표를 씁니다.
-- `format_table_cell` — `target`(T), `row`, `col`, 선택 `background`(`#RRGGBB`), `align`(가로 정렬), `vertical_align`(`top`, `center`, `bottom`).
-- `insert_table` — `target`(P), `cells`(각 행이 문자열 배열인 배열, 모든 행의 열 수가 같아야 함), 선택 `position`(`end`=대상 문단 끝 기본, `after`/`before`=새 문단), `width_mm`(기본: 단·셀 너비), `col_widths`(열 너비 비율 숫자 배열), `header_row`(참/거짓), `header_background`(`#RRGGBB`), `id`.
+- `format_table_cell` — `target`(T), `row`, `col`, 선택 `background`(`#RRGGBB`), `align`(가로 정렬), `vertical_align`(`top`, `center`, `bottom`), 셀 글자 `bold`, `italic`, `size_pt`, `color`, `font`.
+- `insert_table` — `target`(P), `cells`(각 행이 셀 배열인 배열, 모든 행의 열 수가 같아야 함), 선택 `position`(`end`=대상 문단 끝 기본, `after`/`before`=새 문단), `width_mm`(기본: 단·셀 너비), `col_widths`(열 너비 비율 숫자 배열), `col_align`(열마다 가로 정렬 배열), `header_row`(참/거짓), `header_background`·`header_color`(제목 행 배경색·글자색), `stripe_background`(본문 짝수 행 배경색), `border`(`all` 기본, `horizontal`=가로선만, `none`), `border_color`, 표 전체 글자 `font`, `size_pt`, `color`, `bold`, `padding_mm`(셀 안 여백: 숫자 또는 [좌우, 위아래]), `line_spacing_percent`, `markup`(참이면 셀의 `**굵게**` 표시를 굵은 글자로), `id`. 셀은 문자열이거나 `{"text": …, "bold", "italic", "color", "size_pt", "background", "align"}` 객체입니다(예: 정답 행만 빨간 굵은 글자).
+- `insert_line_numbers` — `target`(본문 P), `lines`(그 문단이 차지하는 줄 수), 선택 `start`(첫 번호, 생략하면 앞의 `insert_line_numbers`에 이어서 매김), `every`(몇 줄마다 번호를 보일지, 기본 1), `size_pt`(기본 7), `color`(기본 `#8C8C8C`), `font`, `gap_mm`(번호와 단 가장자리 사이, 기본 1.5), `width_mm`(번호 칸 너비, 기본 6), `side`(`left` 기본/`right`), `pitch_pt`(줄 간격이 비율(%)이 아닐 때 줄 사이 거리), `shift_pt`(번호 위아래 미세 조정, 아래가 +), `id`. 지문 왼쪽 여백에 작은 줄 번호(열번호)를 붙입니다. `lines`와 번호를 붙일 줄은 문서 데이터의 `line_starts`로 정하세요.
 - `delete_object` — `target`(T, I, O). `deletable`이 참인 개체만 지웁니다.
 
 그림 (PNG/JPEG)
@@ -80,8 +82,11 @@ TR은 언제나 **처음 내보낸 원본**에 JSON을 적용합니다. 같은 �
 - 새로 만든 문단·표·그림에 `id`(N으로 시작, 예: `N1`)를 주면 뒤따르는 명령에서 그 이름을 `target`으로 쓸 수 있습니다.
 - 좌표(행·열)는 1부터 셉니다.
 - `editable_segments`가 있는 문단은 `old`를 한 구간 안에서 고르세요. 전각 공백과 줄바꿈 없는 공백도 원문 그대로 씁니다. 문구 편집의 기준은 JSONL의 `text`입니다.
+- `highlighter`는 문단 안의 한글 형광펜 표시 수, `memos`는 문단에 달린 메모 수입니다. 형광펜이 칠해진 글자는 편집 구간에서 빠지므로, 고치기 전에 `format_paragraph`에 `"highlight": null`을 주어 지우세요. 메모는 `delete_memos`로 지웁니다.
 - `char_shape`, `para_shape`, `style`은 서식 색인의 ID입니다. 글자 모양이 섞인 문단의 `char_runs` 항목은 [글자 모양 ID, 시작 위치, 끝 위치]입니다.
+- `line_starts`는 원본보기 PDF에서 그 문단의 각 줄이 시작하는 글자 위치입니다. 줄 수는 배열 길이이고, 어떤 문구가 몇째 줄에 있는지는 그 문구의 시작 위치보다 작거나 같은 값의 개수로 셉니다. 지문에 줄 번호를 붙이고(`insert_line_numbers`) 해설에서 "8~9줄"처럼 근거를 가리킬 때 쓰세요. 그 문단의 글을 고치면 줄이 바뀌므로 줄 번호를 붙인 지문은 고치지 마세요.
 - 줄바꿈·탭은 문구에 넣을 수 없습니다. 새 문단은 `insert_paragraphs`로 넣으세요. 표 셀만 `\\n`으로 여러 줄을 쓸 수 있습니다.
+- 길이 단위: `_pt`는 포인트, `_mm`는 밀리미터입니다.
 
 ## 프로젝트
 

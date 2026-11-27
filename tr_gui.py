@@ -2,21 +2,23 @@
 
 import os
 import queue
-import shutil
 import threading
 import tkinter as tk
 import traceback
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, font, ttk
 
+from tr_batch import save_copy, write_bundle
 from tr_core import AI_DOCUMENT, FORMATS
 from tr_drag import DropReceiver, drag_file
 from tr_history import show_project_history
+from tr_results import ResultPanel
 from tr_surface import clay_photo
-from tr_workflow import (EDIT_TYPES, IMAGE_TYPES, add_images, export_dropped, finish_edit,
+from tr_workflow import (EDIT_TYPES, IMAGE_TYPES, add_images, candidate_paths, export_dropped, finish_edit,
                          pdf_conversion, prepare_edit, project_metadata, project_outputs, projects_folder,
-                         text_document)
+                         text_document, windows_filename)
 
 
 BACKGROUND = "#ECE4F0"
@@ -32,10 +34,13 @@ ACCENT_DARK = "#543480"
 ERROR = "#9B3353"
 SUCCESS = "#2B6A54"
 
-GOLDEN_RATIO = 1.61803398875
-DEFAULT_WIDTH = 848
-DEFAULT_HEIGHT = round(DEFAULT_WIDTH / GOLDEN_RATIO)
-MIN_WIDTH = 735
+DEFAULT_WIDTH = 1180
+DEFAULT_HEIGHT = 760
+MIN_WIDTH = 950
+RESULT_COLORS = {
+    "background": BACKGROUND, "paper": PAPER, "white": WHITE, "text": TEXT, "muted": MUTED,
+    "lavender": LAVENDER, "border": BORDER, "accent": ACCENT, "accent_dark": ACCENT_DARK,
+}
 CARD_COLORS = {
     "source": "#F4E4F0",
     "markdown": "#EEE1F7",
@@ -75,7 +80,7 @@ class FileCard(tk.Canvas):
                  extra=None):
         title_line = fonts["card"].metrics("linespace")
         height = max(84, 3 * title_line + 21) if wide else max(153, 101 + 4 * title_line)
-        super().__init__(parent, background=BACKGROUND, height=height,
+        super().__init__(parent, background=BACKGROUND, width=165, height=height,
                          highlightthickness=0, borderwidth=0, takefocus=True)
         self.title = title
         self.save = save             # wide card: a second button that saves the file elsewhere
@@ -321,11 +326,14 @@ class ConverterWindow:
         self.converted_pdf = None
         self.source_name = None
         self.job = None
+        self.markdown_results = {}
+        self.hancom_results = {}
         self.results = queue.SimpleQueue()
         self.progress_notes = queue.SimpleQueue()   # messages from the worker thread
         self.receiver = None
         self.history_window = None
         self.fonts = screen_fonts(root)
+        ttk.Style(root).theme_use("clam")
 
         root.title("TR · 문서 편집")
         root.configure(background=BACKGROUND)
@@ -338,13 +346,13 @@ class ConverterWindow:
         self.frame = tk.Frame(root, background=BACKGROUND, padx=19, pady=15)
         self.frame.grid(sticky="nsew")
         self.frame.columnconfigure(0, weight=1)
-        self.frame.rowconfigure(3, weight=1)
+        self.frame.rowconfigure(4, weight=1)
         self.build_header()
 
         cards = tk.Frame(self.frame, background=BACKGROUND)
         cards.grid(row=1, column=0, sticky="ew", pady=(10, 6))
-        for index in range(3):
-            cards.columnconfigure(index, weight=1, uniform="workflow")
+        for index, weight in enumerate((5, 5, 8, 6)):
+            cards.columnconfigure(index, weight=weight, uniform="workflow")
         self.source_card = FileCard(cards, "파일을 이곳에 첨부하세요", "source",
                                    self.choose_source, lambda: None, None, fonts=self.fonts)
         self.md_card = FileCard(cards, "AI 업로드용 md 파일", "markdown",
@@ -356,31 +364,40 @@ class ConverterWindow:
                                        lambda: self.open_file(self.text_markdown), self.send_markdown))
         self.json_card = FileCard(cards, "AI가 편집한 JSON·ZIP 파일은 이곳에 업로드하세요", "json",
                                  self.choose_json, lambda: None, None, fonts=self.fonts)
-        self.source_card.grid(row=0, column=0, sticky="ew", padx=(0, 3))
-        self.md_card.grid(row=0, column=1, sticky="ew", padx=3)
-        self.json_card.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+        self.markdown_panel = self.make_result_panel(cards, "Markdown 결과", "원본을 넣으면 여기에 표시됩니다.")
+        self.source_card.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+        self.md_card.grid(row=0, column=1, sticky="nsew", padx=3)
+        self.markdown_panel.grid(row=0, column=2, sticky="nsew", padx=5, pady=4)
+        self.json_card.grid(row=0, column=3, sticky="nsew", padx=(3, 0))
 
         self.result_card = FileCard(self.frame, "편집된 한글 파일", "result",
                                     lambda: self.open_file(self.output),
                                     lambda: self.output if self.job is None else None,
                                     self.send_result, fonts=self.fonts, wide=True, save=self.save_result)
-        self.result_card.grid(row=2, column=0, sticky="ew", pady=(0, 9))
+        self.result_card.grid(row=2, column=0, sticky="ew", pady=(0, 3))
+        self.hancom_panel = self.make_result_panel(self.frame, "한글 파일 결과", "변환하거나 편집한 한글 파일이 여기에 표시됩니다.")
+        self.hancom_panel.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 9))
         self.build_activity()
         root.report_callback_exception = self.callback_error
         root.bind_all("<Control-v>", self.paste_json)
         root.bind_all("<Control-V>", self.paste_json)
         self.refresh()
-        self.set_status("한컴 파일을 놓아 시작하세요. AI가 JSON을 글로만 보여 주면 복사한 뒤 Ctrl+V로 붙여 넣으세요.")
+        self.set_status("한글·PDF 또는 편집 파일을 여러 개 놓을 수 있습니다. 글로 받은 JSON은 Ctrl+V로 붙여 넣으세요.")
         root.update_idletasks()
-        minimum_height = max(440, self.frame.winfo_reqheight())
+        minimum_height = max(630, self.frame.winfo_reqheight())
         root.minsize(MIN_WIDTH, minimum_height)
-        if minimum_height > DEFAULT_HEIGHT:
-            root.geometry(f"{round(minimum_height * GOLDEN_RATIO)}x{minimum_height}")
+        root.geometry(f"{max(MIN_WIDTH, min(DEFAULT_WIDTH, root.winfo_screenwidth() - 36))}x"
+                      f"{max(minimum_height, min(DEFAULT_HEIGHT, root.winfo_screenheight() - 80))}")
         try:
             self.receiver = DropReceiver(root, self.on_drop)
         except (OSError, RuntimeError) as error:
             self.set_status("끌어놓기를 시작할 수 없습니다. 카드를 클릭해 파일을 선택하세요.", "error")
             self.add_log(str(error), "error")
+
+    def make_result_panel(self, parent, title, empty_text):
+        return ResultPanel(parent, title, empty_text, fonts=self.fonts, colors=RESULT_COLORS,
+                           open_file=self.open_file, drag_files=self.drag_selected, save_file=self.save_copy_of,
+                           save_bundle=self.save_bundle, drag_bundle=self.drag_bundle, height=3)
 
     def build_header(self):
         bar = tk.Frame(self.frame, background=BACKGROUND)
@@ -409,7 +426,7 @@ class ConverterWindow:
     def build_activity(self):
         panel = tk.Frame(self.frame, background=PAPER, highlightthickness=1, highlightbackground=BORDER,
                          padx=12, pady=7)
-        panel.grid(row=3, column=0, sticky="nsew", padx=8)
+        panel.grid(row=4, column=0, sticky="nsew", padx=8)
         panel.columnconfigure(0, weight=1)
         panel.rowconfigure(3, weight=1)
         tk.Label(panel, text="작업 기록", background=PAPER, foreground=TEXT,
@@ -418,7 +435,6 @@ class ConverterWindow:
                                anchor="nw", justify="left", height=2)
         self.status.grid(row=1, column=0, sticky="ew", pady=(2, 5))
         style = ttk.Style(self.root)
-        style.theme_use("clam")
         style.configure("TR.Horizontal.TProgressbar", background=ACCENT, thickness=4,
                         troughcolor=LAVENDER, bordercolor=LAVENDER, lightcolor=ACCENT, darkcolor=ACCENT)
         track = tk.Frame(panel, background=LAVENDER, height=5)
@@ -462,12 +478,14 @@ class ConverterWindow:
                                      "끌어서 다른 폴더로 · AI로 고치려면 위의 AI용.md를 첨부" if converted
                                      else "끌어서 다른 폴더로" if result else "",
                                      result is not None)
+        self.markdown_panel.set_paths(path for path in self.markdown_results if path.is_file())
+        self.hancom_panel.set_paths(path for path in self.hancom_results if path.is_file())
 
     def choose_source(self):
-        selected = filedialog.askopenfilename(parent=self.root, title="원본 파일 첨부",
-                                               filetypes=[("한글 문서 또는 PDF", "*.hwp *.hwpx *.pdf")])
+        selected = filedialog.askopenfilenames(parent=self.root, title="원본 파일 첨부",
+                                                filetypes=[("한글 문서 또는 PDF", "*.hwp *.hwpx *.pdf")])
         if selected:
-            self.on_drop((Path(selected),))
+            self.on_drop(tuple(map(Path, selected)))
 
     def choose_json(self):
         selected = filedialog.askopenfilenames(
@@ -480,7 +498,7 @@ class ConverterWindow:
         if self.job is not None:
             self.add_log("진행 중인 변환이 끝나면 다음 파일을 놓아 주세요.")
             return
-        paths = [Path(path) for path in paths]
+        paths = list(dict.fromkeys(map(Path, paths)))
         if not paths:
             return
         if len(paths) == 1 and paths[0].is_dir():
@@ -497,20 +515,15 @@ class ConverterWindow:
             self.report_error(f"TR이 다룰 수 없는 파일입니다. {others[0].name}  "
                               "한컴 파일·PDF, 편집 JSON·ZIP, PNG·JPEG 그림을 놓아 주세요.")
         elif documents:
-            if len(paths) != 1:
-                self.report_error("한글 문서와 PDF는 한 번에 하나만 놓아 주세요.")
-            elif documents[0].suffix.lower() == ".pdf":
-                self.start("export", "PDF를 한글 파일로 바꾸는 중입니다. 쪽마다 원본과 맞춰 보느라 "
-                           "40쪽에 2~3분 정도 걸립니다.",
-                           export_dropped, documents[0], self.progress_notes.put, label=documents[0].name)
+            if edits or images:
+                self.report_error("원본 파일과 편집 파일·그림은 따로 넣어 주세요.")
             else:
-                self.start("export", "한컴 파일을 읽고 gpt 폴더에 프로젝트를 만드는 중입니다.",
-                           export_dropped, documents[0], label=documents[0].name)
+                self.start_batch("export", documents)
         elif edits:
-            if len(edits) != 1:
-                self.report_error("편집 JSON은 한 번에 하나만 놓아 주세요. 그림은 함께 놓아도 됩니다.")
+            if len(edits) > 1 and images:
+                self.report_error("편집 파일을 여러 개 넣을 때는 JSON과 해당 그림을 파일별로 ZIP에 묶어 주세요.")
             else:
-                self.begin_apply(edits[0], images=images)
+                self.start_batch("apply", edits, images=images)
         elif images:
             self.add_project_images(images)
 
@@ -545,15 +558,10 @@ class ConverterWindow:
                 return "break"
         except OSError:
             pass
-        self.begin_apply(None, text=text)
+        self.start_batch("apply", (None,), text=text)
         return "break"
 
-    def begin_apply(self, path, *, text=None, images=()):
-        try:
-            pending = prepare_edit(path, text=text, images=images, active_project=self.project)
-        except (OSError, ValueError) as error:
-            self.report_error(str(error))
-            return
+    def choose_missing_images(self, pending):
         for name, note in pending.missing:
             description = f" · {note}" if note else ""
             self.set_status(f"편집에 필요한 그림 {name}이 없습니다. 이 자리에 넣을 그림을 골라 주세요.", "busy")
@@ -566,24 +574,70 @@ class ConverterWindow:
                 self.add_log(f"{name} ← {Path(selected).name}", "ok")
             else:
                 self.add_log(f"{name}을 고르지 않았습니다. 이 그림 편집은 건너뜁니다.", "error")
-        label = pending.source_label
-        self.start("apply", "편집 JSON을 적용하고 한글 파일을 저장하는 중입니다.", finish_edit, pending, label=label)
 
-    def start(self, kind, message, action, *args, label=""):
+    def start_batch(self, kind, paths, *, text=None, images=()):
         self.job = kind
+        self.batch_paths = deque(paths)
+        self.batch_total = len(paths)
+        self.batch_index = 0
+        self.batch_saved = 0
+        self.batch_partial = 0
+        self.batch_project = self.project
+        self.batch_text = text
+        self.batch_images = images
+        self.hancom_results.clear()
+        if kind == "export":
+            self.markdown_results.clear()
+        self.output = None
+        self.progress.configure(mode="determinate", maximum=self.batch_total, value=0)
         self.refresh()
-        self.set_status(message, "busy")
-        self.add_log(f"{message}  {label}")
-        self.progress.configure(mode="indeterminate")
-        self.progress.start(14)
+        self.advance_batch()
 
-        results = self.results
+    def advance_batch(self):
+        self.progress.configure(value=self.batch_index)
+        if not self.batch_paths:
+            failed = self.batch_total - self.batch_saved
+            summary = f"{self.batch_total}개 중 {self.batch_saved}개 저장"
+            if failed:
+                summary += f" · {failed}개 실패"
+            if self.batch_partial:
+                summary += f" · {self.batch_partial}개는 일부 편집 확인 필요"
+            level = "error" if not self.batch_saved else "busy" if failed or self.batch_partial else "ok"
+            self.job = None
+            self.batch_text = None
+            self.batch_images = ()
+            self.refresh()
+            self.set_status(summary, level)
+            self.add_log(summary, level)
+            if self.history_window is not None and self.history_window.winfo_exists():
+                self.history_window.refresh_history(self.project)
+            return
 
+        path = self.batch_paths.popleft()
+        self.batch_index += 1
+        self.batch_label = f"{self.batch_index}/{self.batch_total} · {path.name if path else '붙여 넣은 JSON'}"
+        self.set_status(self.batch_label, "busy")
+        self.add_log(f"처리 중 · {self.batch_label}")
+        if self.job == "export":
+            self.run_job(export_dropped, path, self.progress_notes.put)
+        else:
+            try:
+                pending = prepare_edit(path, text=self.batch_text, images=self.batch_images,
+                                       active_project=self.batch_project)
+                self.choose_missing_images(pending)
+            except Exception as error:
+                detail = str(error) or type(error).__name__
+                self.add_log(f"실패 · {self.batch_label} · {detail}", "error")
+                self.root.after_idle(self.advance_batch)
+                return
+            self.run_job(finish_edit, pending)
+
+    def run_job(self, action, *args):
         def work():
             try:
-                results.put((action(*args), None))
+                self.results.put((action(*args), None))
             except Exception as error:
-                results.put((None, str(error) or type(error).__name__))
+                self.results.put((None, str(error) or type(error).__name__))
 
         threading.Thread(target=work, name="tr-converter").start()
         self.root.after(60, self.check_result)
@@ -596,36 +650,28 @@ class ConverterWindow:
             except queue.Empty:
                 break
         if note:
-            self.set_status(note, "busy")
+            self.set_status(f"{self.batch_label}\n{note}", "busy")
         try:
             result, error = self.results.get_nowait()
         except queue.Empty:
             self.root.after(60, self.check_result)
             return
-        kind, self.job = self.job, None
-        self.progress.stop()
-        self.progress.configure(mode="determinate", value=0)
         if error is not None:
-            self.refresh()
-            self.report_error(error)
-            return
-        if kind == "export":
+            self.add_log(f"실패 · {self.batch_label} · {error}", "error")
+        elif self.job == "export":
             project, detail = result
             self.select_project(project)
+            self.add_markdown_results()
             if self.converted_pdf is not None:
-                self.set_status("PDF를 한글 파일로 바꿨습니다. 아래 카드에서 열거나 저장하세요. "
-                                "AI로 고치려면 AI용.md를 첨부하세요.", "ok")
-            else:
-                self.set_status("AI 업로드용 md 파일이 준비되었습니다. 글자만 필요하면 카드 안의 "
-                                "'텍스트 파일' 버튼을 끌거나 클릭하세요.", "ok")
+                self.hancom_results[self.converted_pdf] = None
             self.add_log(f"{detail}  {project}", "ok")
         else:
             project, output, report, report_path = result
             self.select_project(project)
             self.output = output
-            attention = bool(report.failures or report.unresolved)
-            self.set_status("편집된 한글 파일을 저장했습니다." + (" 건너뛴 편집이나 남은 지시를 확인하세요."
-                                                                if attention else ""), "busy" if attention else "ok")
+            self.hancom_results[output] = None
+            if report.failures or report.unresolved:
+                self.batch_partial += 1
             self.add_log(f"{report}  {self.output}", "ok")
             for note in report.notes:
                 self.add_log(f"AI 메모 · {note}")
@@ -637,9 +683,13 @@ class ConverterWindow:
                 self.add_log(f"남은 지시 {label} · {instruction}", "error")
             if report_path is not None:
                 self.add_log(f"적용 보고를 저장했습니다. AI에게 다시 보낼 메시지가 들어 있습니다.  {report_path}")
+        if error is None:
+            self.batch_saved += 1
         self.refresh()
-        if self.history_window is not None and self.history_window.winfo_exists():
-            self.history_window.refresh_history(self.project)
+        self.root.after_idle(self.advance_batch)
+
+    def add_markdown_results(self):
+        self.markdown_results.update(dict.fromkeys(path for path in (self.markdown, self.text_markdown) if path))
 
     def select_project(self, project):
         self.project = project
@@ -661,6 +711,11 @@ class ConverterWindow:
             self.report_error(f"프로젝트를 찾을 수 없습니다. {project}")
             return False
         self.select_project(project)
+        self.markdown_results.clear()
+        self.add_markdown_results()
+        self.hancom_results = dict.fromkeys(project_outputs(project))
+        if self.converted_pdf is not None:
+            self.hancom_results[self.converted_pdf] = None
         self.refresh()
         self.set_status("이전 프로젝트를 불러왔습니다.", "ok")
         self.add_log(str(project), "ok")
@@ -681,12 +736,8 @@ class ConverterWindow:
             self.history_window.lift()
             self.history_window.focus_set()
             return
-        palette = {
-            "background": BACKGROUND, "paper": PAPER, "white": WHITE, "text": TEXT, "muted": MUTED,
-            "lavender": LAVENDER, "border": BORDER, "accent": ACCENT, "accent_dark": ACCENT_DARK,
-        }
         self.history_window = show_project_history(
-            self.root, fonts=self.fonts, colors=palette, active_project=self.project,
+            self.root, fonts=self.fonts, colors=RESULT_COLORS, active_project=self.project,
             load_project=self.load_project, open_file=self.open_file,
         )
 
@@ -731,35 +782,75 @@ class ConverterWindow:
     def send_result(self, path):
         if self.send_file(path, allow_move=True) == "move":
             self.output = None
+            self.hancom_results.pop(path, None)
             self.refresh()
             self.set_status("결과 파일을 프로젝트 밖으로 이동했습니다.", "ok")
             self.add_log(f"이동 후 프로젝트 폴더에서 빠진 파일 · {path.name}", "ok")
 
     def save_result(self):
-        """Save a copy of the result (a PDF conversion or an edited file) wherever the user picks."""
         if self.output is None or self.job is not None:
             return
-        source = self.output
-        name = source.name
-        if source == self.converted_pdf:
+        name = self.output.name
+        if self.output == self.converted_pdf:
             name = Path(self.source_name).with_suffix(".hwp").name
-        extension = source.suffix.lower()
-        selected = filedialog.asksaveasfilename(
-            parent=self.root, title="한글 파일 저장", initialfile=name, defaultextension=extension,
-            initialdir=str(Path.home() / "Downloads") if (Path.home() / "Downloads").is_dir() else None,
-            filetypes=[("한글 문서", f"*{extension}")])
-        if not selected:
+        self.save_copy_of(self.output, name=name)
+
+    def ask_destination(self, title, name, kind):
+        extension = Path(name).suffix.lower()
+        downloads = Path.home() / "Downloads"
+        path = filedialog.asksaveasfilename(parent=self.root, title=title, initialfile=name,
+                                            defaultextension=extension,
+                                            initialdir=str(downloads) if downloads.is_dir() else None,
+                                            filetypes=[(kind, f"*{extension}")])
+        return Path(path) if path else None
+
+    def save_copy_of(self, source, *, name=None):
+        markdown = source.suffix.lower() == ".md"
+        if name is None:
+            name = windows_filename(source.parent.name, f" - {source.name}") if markdown else source.name
+        kind = "Markdown" if markdown else "한글 파일"
+        target = self.ask_destination(f"{kind} 저장", name, kind)
+        if target is None:
             return
-        target = Path(selected)
         try:
-            if target.resolve() == source.resolve():
-                return
-            shutil.copyfile(source, target)
-        except OSError as error:
+            save_copy(source, target)
+        except (OSError, ValueError) as error:
             self.report_error(str(error))
             return
-        self.set_status("한글 파일을 저장했습니다.", "ok")
         self.add_log(f"저장 · {target}", "ok")
+
+    @staticmethod
+    def bundle_title(paths):
+        return "TR Markdown 묶음" if paths[0].suffix.lower() == ".md" else "TR 한글 파일 묶음"
+
+    def save_bundle(self, paths):
+        target = self.ask_destination("ZIP 묶음 저장", self.bundle_title(paths) + ".zip", "ZIP 묶음")
+        if target is None:
+            return
+        try:
+            write_bundle(paths, target)
+        except (OSError, ValueError) as error:
+            self.report_error(str(error))
+            return
+        self.add_log(f"ZIP {len(paths)}개 묶음 저장 · {target}", "ok")
+
+    def drag_selected(self, paths):
+        if len(paths) == 1:
+            self.send_file(paths[0], allow_move=False)
+        else:
+            self.drag_bundle(paths)
+
+    def drag_bundle(self, paths):
+        # Keep the archive available for targets that read the file after the drop.
+        folder = projects_folder() / "묶음"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            target = next(candidate_paths(folder, self.bundle_title(paths), "", ".zip"))
+            write_bundle(paths, target)
+        except (OSError, ValueError) as error:
+            self.report_error(str(error))
+            return
+        self.send_file(target, allow_move=False)
 
     def send_file(self, path, *, allow_move):
         try:
@@ -781,8 +872,31 @@ class ConverterWindow:
         self.root.destroy()
 
 
+# Kept beside the program, not in the repository (it holds other companies' logos). Windows caches
+# icons by path, so a redesigned icon gets a new file name rather than overwriting this one.
+ICON_FILE = "TR 아이콘.ico"
+
+
+def use_tr_icon(root):
+    """Show the TR icon on the window and taskbar."""
+    icon = Path(__file__).with_name(ICON_FILE)
+    if not icon.is_file():
+        return
+    try:
+        root.iconbitmap(default=str(icon))   # default=: the history window uses it too
+    except tk.TclError:
+        pass
+
+
 def main():
+    try:
+        # Group TR under its own taskbar button instead of Python's, so the TR icon shows.
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TR.DocumentEditor")
+    except (AttributeError, OSError):
+        pass
     root = tk.Tk()
+    use_tr_icon(root)
     ConverterWindow(root)
     root.mainloop()
 

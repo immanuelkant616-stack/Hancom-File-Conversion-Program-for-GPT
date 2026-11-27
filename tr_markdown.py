@@ -176,8 +176,9 @@ def _paragraph_style(shape):
         spacing = f"{line_spacing}%" if line_spacing else "–"
     else:
         spacing = f"{spacing_type} {_mm(_int(margins, 'LineSpacing'))} mm"
-    indent = _int(margins, "Indent")
-    spacing_before_after = f"{_int(margins, 'Prev') / 100:g} / {_int(margins, 'Next') / 100:g}"
+    # PARAMARGIN lengths are stored at twice the HWPUNIT scale.
+    indent = _int(margins, "Indent") / 2
+    spacing_before_after = f"{_int(margins, 'Prev') / 200:g} / {_int(margins, 'Next') / 200:g}"
     return (_literal(_ALIGNMENTS.get(align, align) or "–"), _literal(spacing),
             f"{_mm(indent)} mm" if indent else "–", spacing_before_after)
 
